@@ -63,6 +63,9 @@ GAME_TIMEOUT_MINUTES = 30
 PENDING_PROOF: dict = {}
 PENDING_CAPTCHA: dict = {}
 
+# نشانه‌های نقطه که باعث بن می‌شوند
+DOT_CHARS = [".", "۔", "•", "·", "⋅", "٫", "٬", "。", "｡", "…"]
+
 
 # ============================================================
 # LOGGING
@@ -155,6 +158,14 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 processed_at TIMESTAMP DEFAULT NULL,
                 processed_by INTEGER DEFAULT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT DEFAULT '',
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                banned_by INTEGER DEFAULT NULL
             )
         """)
 
@@ -252,6 +263,146 @@ def is_valid_trx_address(addr):
     a = str(addr).strip()
     return bool(re.match(r"^T[A-Za-z0-9]{33}$", a))
 
+
+# ============================================================
+# BAN LOGIC
+# ============================================================
+
+def is_banned(user_id):
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT user_id FROM banned_users WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+    return bool(row)
+
+
+def has_invalid_name(user):
+    """
+    True اگر:
+      • اسم خالی باشد
+      • یوزرنیم (پروفایل) خالی باشد
+      • اسم شامل نقطه باشد
+    """
+    name = (user.first_name or "").strip()
+    username = (user.username or "").strip()
+
+    if not name:
+        return True
+    if not username:
+        return True
+    for d in DOT_CHARS:
+        if d in name:
+            return True
+    return False
+
+
+def get_ban_reason(user):
+    name = (user.first_name or "").strip()
+    username = (user.username or "").strip()
+
+    if not name and not username:
+        return "بدون اسم و بدون پروفایل"
+    if not name:
+        return "بدون اسم"
+    if not username:
+        return "بدون پروفایل (یوزرنیم)"
+
+    for d in DOT_CHARS:
+        if d in name:
+            return f"اسم شامل نقطه ({d})"
+
+    return "نامعتبر"
+
+
+def ban_user(user_id, reason="", banned_by=None):
+    """کاربر را بن می‌کند و موجودی‌اش را صفر می‌کند. موجودی قبلی را برمی‌گرداند."""
+    with closing(get_db()) as db:
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            old_balance = Decimal(row["balance"]) if row else Decimal("0")
+
+            if not row:
+                db.execute("""
+                    INSERT OR IGNORE INTO users(user_id, balance)
+                    VALUES (?, '0')
+                """, (user_id,))
+
+            db.execute("""
+                INSERT OR REPLACE INTO banned_users(user_id, reason, banned_by)
+                VALUES (?, ?, ?)
+            """, (user_id, reason, banned_by))
+
+            db.execute(
+                "UPDATE users SET balance = '0' WHERE user_id = ?",
+                (user_id,)
+            )
+
+            if old_balance > 0:
+                db.execute("""
+                    INSERT INTO transactions(user_id, type, amount, description)
+                    VALUES (?, 'ban_zero', ?, ?)
+                """, (user_id, str(-old_balance), f"Banned: {reason}"))
+
+            db.commit()
+            return old_balance
+        except Exception:
+            db.rollback()
+            logger.exception("ban_user failed")
+            return None
+
+
+def unban_user(user_id):
+    with closing(get_db()) as db:
+        db.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+        db.commit()
+
+
+def auto_ban_invalid_users():
+    """کاربران قبلی که شرایط بن را دارند، بن می‌شوند."""
+    with closing(get_db()) as db:
+        rows = db.execute(
+            "SELECT user_id, first_name, username FROM users"
+        ).fetchall()
+
+    count = 0
+    for r in rows:
+        uid = int(r["user_id"])
+        if is_owner(uid):
+            continue
+        if is_banned(uid):
+            continue
+
+        name = (r["first_name"] or "").strip()
+        username = (r["username"] or "").strip()
+
+        reason = None
+        if not name and not username:
+            reason = "بدون اسم و بدون پروفایل"
+        elif not name:
+            reason = "بدون اسم"
+        elif not username:
+            reason = "بدون پروفایل (یوزرنیم)"
+        else:
+            for d in DOT_CHARS:
+                if d in name:
+                    reason = f"اسم شامل نقطه ({d})"
+                    break
+
+        if reason:
+            ban_user(uid, reason=f"auto: {reason}")
+            count += 1
+
+    logger.info("Auto-ban: %s user(s) banned.", count)
+    return count
+
+
+# ============================================================
+# USER HELPERS
+# ============================================================
 
 def ensure_user(user):
     if not user:
@@ -409,7 +560,6 @@ def set_bot_enabled(enabled):
 # ============================================================
 
 async def safe_send_message(bot, chat_id, text, **kwargs):
-    # ⛔ کیبورد پایین صفحه در گپ/سوپرگپ ارسال نشه
     rm = kwargs.get("reply_markup")
     if isinstance(rm, ReplyKeyboardMarkup) and not is_pv_chat_id(chat_id):
         kwargs.pop("reply_markup", None)
@@ -592,6 +742,61 @@ async def require_captcha_and_membership(update, context):
     chat = update.effective_chat
     if update.callback_query:
         chat = update.callback_query.message.chat
+
+    # 🚫 بن
+    if is_banned(user.id):
+        if chat and chat.type == ChatType.PRIVATE:
+            await safe_send_message(
+                context.bot, user.id,
+                "🚫 <b>شما از ربات بن شده‌اید.</b>\n\n"
+                "دسترسی شما به ربات مسدود است.",
+                parse_mode="HTML"
+            )
+        return False
+
+    # 🚫 اسم/پروفایل نامعتبر → بن خودکار
+    if has_invalid_name(user):
+        if not is_banned(user.id):
+            reason = get_ban_reason(user)
+            old = ban_user(user.id, reason=reason, banned_by=None)
+
+            if chat and chat.type == ChatType.PRIVATE:
+                await safe_send_message(
+                    context.bot, user.id,
+                    "🚫 <b>شما از ربات بن شدید!</b>\n\n"
+                    f"📌 دلیل: <b>{reason}</b>\n\n"
+                    "برای رفع بن:\n"
+                    "• در تنظیمات تلگرام یک <b>اسم</b> بدون نقطه بگذارید\n"
+                    "• یک <b>یوزرنیم (پروفایل)</b> تنظیم کنید\n\n"
+                    "سپس دوباره /start بزنید.",
+                    parse_mode="HTML"
+                )
+
+            if old and old > 0:
+                try:
+                    await safe_send_message(
+                        context.bot, OWNER_ID,
+                        f"🚫 <b>بن خودکار</b>\n\n"
+                        f"👤 {safe_name(user.first_name or '-')}\n"
+                        f"🔗 @{safe_name(user.username or '-')}\n"
+                        f"🆔 <code>{user.id}</code>\n"
+                        f"📌 دلیل: {reason}\n"
+                        f"💰 موجودی صفر شد: {money(old)} {CURRENCY}",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+        else:
+            if chat and chat.type == ChatType.PRIVATE:
+                await safe_send_message(
+                    context.bot, user.id,
+                    "🚫 شما بن هستید.\n"
+                    "ابتدا اسم (بدون نقطه) و پروفایل خود را تنظیم کنید.",
+                    parse_mode="HTML"
+                )
+        return False
+
+    # در گپ‌ها کپچا لازم نیست
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         return True
 
@@ -612,6 +817,23 @@ async def membership_callback(update, context):
         pass
 
     user = query.from_user
+
+    if is_banned(user.id):
+        try:
+            await query.answer("🚫 شما بن هستید.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    if has_invalid_name(user):
+        if not is_banned(user.id):
+            reason = get_ban_reason(user)
+            ban_user(user.id, reason=reason, banned_by=None)
+            try:
+                await query.answer("🚫 بن شدید.", show_alert=True)
+            except Exception:
+                pass
+        return
 
     if await check_membership(user.id, context):
         if not is_owner(user.id) and not is_captcha_verified(user.id):
@@ -713,7 +935,7 @@ async def captcha_callback(update, context):
 
 
 # ============================================================
-# REFERRAL GRANT
+# REFERRAL GRANT (با پیام تضمینی)
 # ============================================================
 
 async def try_grant_referral(user_id, context):
@@ -761,20 +983,27 @@ async def try_grant_referral(user_id, context):
                 INSERT INTO referrals(referrer_id, referred_id, reward)
                 VALUES (?, ?, ?)
             """, (referrer_id, user_id, str(reward_amount)))
+
+            bal_row = db.execute(
+                "SELECT balance FROM users WHERE user_id = ?", (referrer_id,)
+            ).fetchone()
+            old_balance = Decimal(bal_row["balance"])
+            new_balance = old_balance + reward_amount
+            db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (str(new_balance), referrer_id)
+            )
+            db.execute("""
+                INSERT INTO transactions(user_id, type, amount, description)
+                VALUES (?, 'referral', ?, ?)
+            """, (referrer_id, str(reward_amount), f"Referral {user_id}"))
             db.commit()
         except Exception:
             db.rollback()
             logger.exception("Referral insert failed")
             return
 
-    try:
-        change_balance(
-            referrer_id, reward_amount, "referral", f"Referral {user_id}"
-        )
-    except Exception:
-        logger.exception("Referral reward credit failed")
-        return
-
+    # 🔔 پیام به معرف
     try:
         with closing(get_db()) as db:
             r = db.execute(
@@ -801,6 +1030,17 @@ async def try_grant_referral(user_id, context):
         )
     except Exception:
         logger.warning("Referral PV notify failed")
+
+    # 🔔 پیام به کاربر جدید
+    try:
+        await safe_send_message(
+            context.bot, user_id,
+            "🎁 <b>پاداش زیرمجموعه ثبت شد!</b>\n\n"
+            "شما با لینک دعوت وارد شدید و پاداش برای معرف شما ثبت شد.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -840,6 +1080,7 @@ def admin_reply_keyboard():
             ["➕ شارژ کاربر", "➖ کسر کاربر"],
             ["🏧 برداشت‌های در انتظار"],
             ["💰 موجودی کاربران"],
+            ["🚫 بن کاربر", "✅ آنبن کاربر"],
             [
                 f"➖ کاهش پاداش ({money(reward)})",
                 "➕ افزایش پاداش",
@@ -885,6 +1126,50 @@ async def start(update, context):
         return
     ensure_user(user)
 
+    chat = update.effective_chat
+
+    # 🚫 بن / اسم نامعتبر
+    if not is_owner(user.id):
+        if is_banned(user.id):
+            if chat and chat.type == ChatType.PRIVATE:
+                await safe_send_message(
+                    context.bot, update.effective_chat.id,
+                    "🚫 <b>شما از ربات بن شده‌اید.</b>",
+                    parse_mode="HTML"
+                )
+            return
+
+        if has_invalid_name(user):
+            if not is_banned(user.id):
+                reason = get_ban_reason(user)
+                old = ban_user(user.id, reason=reason, banned_by=None)
+
+                if chat and chat.type == ChatType.PRIVATE:
+                    await safe_send_message(
+                        context.bot, update.effective_chat.id,
+                        "🚫 <b>شما از ربات بن شدید!</b>\n\n"
+                        f"📌 دلیل: <b>{reason}</b>\n\n"
+                        "اسم بدون نقطه و پروفایل تنظیم کنید و دوباره /start بزنید.",
+                        parse_mode="HTML"
+                    )
+
+                if old and old > 0:
+                    try:
+                        await safe_send_message(
+                            context.bot, OWNER_ID,
+                            f"🚫 <b>بن خودکار</b>\n\n"
+                            f"👤 {safe_name(user.first_name or '-')}\n"
+                            f"🔗 @{safe_name(user.username or '-')}\n"
+                            f"🆔 <code>{user.id}</code>\n"
+                            f"📌 دلیل: {reason}\n"
+                            f"💰 موجودی صفر شد: {money(old)} {CURRENCY}",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+            return
+
+    # ثبت رفرال
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
@@ -911,7 +1196,6 @@ async def start(update, context):
                             """, (referrer_id, user.id))
                             db.commit()
 
-    chat = update.effective_chat
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
@@ -1062,7 +1346,7 @@ async def show_help(update, context, target=None):
 
 
 # ============================================================
-# TRANSFER (reply)
+# TRANSFER
 # ============================================================
 
 async def transfer(update, context, amount):
@@ -1086,6 +1370,9 @@ async def transfer(update, context, amount):
         return
     if target.is_bot:
         await message.reply_text("❌ انتقال به ربات امکان‌پذیر نیست.")
+        return
+    if is_banned(target.id):
+        await message.reply_text("❌ این کاربر بن است.")
         return
 
     ensure_user(target)
@@ -1166,10 +1453,23 @@ async def transfer_by_id(update, context, amount, target_id):
     if target_id <= 0:
         await message.reply_text("❌ آیدی عددی صحیح نیست.")
         return
+    if is_banned(target_id):
+        await message.reply_text("❌ این کاربر بن است.")
+        return
 
-    ensure_user_id(target_id)
+    # چک وجود کاربر واقعی
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT user_id FROM users WHERE user_id = ?", (target_id,)
+        ).fetchone()
+    if not row:
+        await message.reply_text(
+            "❌ کاربر مورد نظر در ربات ثبت نشده است.\n"
+            "باید اول ربات را استارت کند."
+        )
+        return
+
     error_code = None
-
     with closing(get_db()) as db:
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -1522,7 +1822,7 @@ async def admin_balance_by_id(update, context):
     if text == "لغو":
         context.user_data.pop("admin_operation", None)
         context.user_data.pop("admin_waiting", None)
-        
+
         kwargs = {"reply_markup": admin_reply_keyboard()}
         if update.message.chat.type != ChatType.PRIVATE:
             kwargs["reply_markup"] = ReplyKeyboardRemove()
@@ -1660,7 +1960,6 @@ async def admin_change_by_reply(update, context, operation, amount):
         **kwargs
     )
 
-    # اطلاع به کاربر
     try:
         await safe_send_message(
             context.bot, target.id,
@@ -1693,6 +1992,9 @@ async def send_admin_stats(update, context):
         verified = db.execute("""
             SELECT COUNT(*) AS c FROM users WHERE captcha_verified = 1
         """).fetchone()["c"]
+        banned_count = db.execute("""
+            SELECT COUNT(*) AS c FROM banned_users
+        """).fetchone()["c"]
 
     total = float(total_row["total"] or 0)
     reward = get_referral_reward()
@@ -1701,6 +2003,7 @@ async def send_admin_stats(update, context):
         "📊 <b>آمار BET_BT</b>\n\n"
         f"👤 کاربران: {users}\n"
         f"✅ تأیید‌شده (کپچا): {verified}\n"
+        f"🚫 بن‌شده‌ها: {banned_count}\n"
         f"💰 مجموع موجودی: {total:.4f} {CURRENCY}\n"
         f"👥 زیرمجموعه‌ها: {referrals}\n"
         f"🎁 پاداش زیرمجموعه: {money(reward)} {CURRENCY}\n"
@@ -1821,6 +2124,187 @@ async def send_admin_balances(update, context):
 
 
 # ============================================================
+# BAN COMMANDS
+# ============================================================
+
+async def ban_command(update, context):
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("❌ دسترسی ندارید.")
+        return
+
+    message = update.message
+    target_id = None
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    elif context.args:
+        try:
+            target_id = int(normalize_digits(context.args[0]))
+        except Exception:
+            target_id = None
+
+    if not target_id:
+        await message.reply_text(
+            "❌ استفاده:\n"
+            "<code>/ban 123456789</code>\n"
+            "یا روی پیام کاربر ریپلای کنید.",
+            parse_mode="HTML"
+        )
+        return
+
+    if target_id == user.id:
+        await message.reply_text("❌ نمی‌توانید خودتان را بن کنید.")
+        return
+
+    if is_banned(target_id):
+        await message.reply_text("ℹ️ این کاربر قبلاً بن شده است.")
+        return
+
+    old_balance = ban_user(target_id, reason="owner_ban", banned_by=user.id)
+
+    if old_balance is None:
+        await message.reply_text("❌ خطا در بن.")
+        return
+
+    target_name = safe_name(get_user_display_name(target_id))
+
+    # 💬 پیام در چت جاری (گروه یا پیوی)
+    await message.reply_text(
+        "🚫 <b>کاربر از ربات بن شد!</b>\n\n"
+        f"👤 {target_name}\n"
+        f"🆔 <code>{target_id}</code>\n"
+        f"💰 موجودی صفر شد: <b>{money(old_balance)} {CURRENCY}</b>\n\n"
+        "✅ از ربات بن شد و موجودی صفر شد.",
+        parse_mode="HTML"
+    )
+
+    # 💬 پیام در پیوی کاربر
+    try:
+        await safe_send_message(
+            context.bot, target_id,
+            "🚫 <b>شما از ربات بن شدید!</b>\n\n"
+            f"💰 موجودی شما ({money(old_balance)} {CURRENCY}) صفر شد.\n"
+            "دسترسی شما به ربات مسدود است.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        logger.warning("Could not notify banned user %s", target_id)
+
+    # 🔔 پیام به مالک در پیوی
+    try:
+        await safe_send_message(
+            context.bot, OWNER_ID,
+            f"🚫 کاربر <code>{target_id}</code> بن شد.\n"
+            f"💰 موجودی صفرشده: {money(old_balance)} {CURRENCY}",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+async def unban_command(update, context):
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("❌ دسترسی ندارید.")
+        return
+
+    message = update.message
+    target_id = None
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    elif context.args:
+        try:
+            target_id = int(normalize_digits(context.args[0]))
+        except Exception:
+            target_id = None
+
+    if not target_id:
+        await message.reply_text(
+            "❌ استفاده:\n"
+            "<code>/unban 123456789</code>\n"
+            "یا روی پیام کاربر ریپلای کنید.",
+            parse_mode="HTML"
+        )
+        return
+
+    if not is_banned(target_id):
+        await message.reply_text("ℹ️ این کاربر بن نیست.")
+        return
+
+    unban_user(target_id)
+
+    await message.reply_text(
+        f"✅ کاربر <code>{target_id}</code> از بن خارج شد.\n\n"
+        "⚠️ توجه: اگر هنوز اسم یا پروفایل نداشته باشد،\n"
+        "با اولین /start دوباره بن می‌شود.",
+        parse_mode="HTML"
+    )
+
+    try:
+        await safe_send_message(
+            context.bot, target_id,
+            "✅ <b>شما از بن خارج شدید!</b>\n\n"
+            "حالا می‌توانید از ربات استفاده کنید.\n"
+            "⚠️ اگر اسم یا پروفایل نداشته باشید، دوباره بن می‌شوید.",
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
+    except Exception:
+        logger.warning("Could not notify unbanned user %s", target_id)
+
+
+async def banned_list_command(update, context):
+    user = update.effective_user
+    if not is_owner(user.id):
+        return
+
+    with closing(get_db()) as db:
+        rows = db.execute("""
+            SELECT b.user_id, b.reason, b.banned_at,
+                   u.first_name, u.username
+            FROM banned_users b
+            LEFT JOIN users u ON u.user_id = b.user_id
+            ORDER BY b.banned_at DESC
+            LIMIT 50
+        """).fetchall()
+
+    if not rows:
+        await update.message.reply_text("🚫 هیچ کاربری بن نیست.")
+        return
+
+    lines = [f"🚫 <b>لیست بن‌شده‌ها ({len(rows)})</b>\n"]
+    for r in rows:
+        name = r["first_name"] or r["username"] or "-"
+        lines.append(
+            f"• <code>{r['user_id']}</code> — {safe_name(name)} "
+            f"({safe_name(r['reason'] or '-')})"
+        )
+    text = "\n".join(lines)
+
+    if len(text) <= 3800:
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            await safe_send_message(
+                context.bot, update.effective_chat.id, chunk,
+                parse_mode="HTML"
+            )
+            chunk = line + "\n"
+        else:
+            chunk += line + "\n"
+    if chunk:
+        await safe_send_message(
+            context.bot, update.effective_chat.id, chunk,
+            parse_mode="HTML"
+        )
+
+
+# ============================================================
 # WITHDRAW CALLBACK
 # ============================================================
 
@@ -1868,6 +2352,7 @@ async def withdraw_callback(update, context):
                     (wd_user_id,)
                 ).fetchone()
                 if not row:
+                    # کاربر نیست → برگرداندن پول به حساب شبح نمی‌شود، پس رد کن
                     db.rollback()
                     try:
                         await query.answer("❌ کاربر پیدا نشد.", show_alert=True)
@@ -2516,6 +3001,8 @@ async def user_game_dice_handler(update, context):
         return
     if not message.dice:
         return
+    if is_banned(user.id):
+        return
 
     game = get_active_game_for_user(chat.id, user.id)
     if not game:
@@ -3133,9 +3620,7 @@ async def text_handler(update, context):
     raw_text = message.text.strip()
     text = normalize_digits(raw_text).strip()
 
-    # ========================================================
-    # WITHDRAW FLOW (پیوی)
-    # ========================================================
+    # WITHDRAW FLOW
     step = context.user_data.get("withdraw_step")
 
     if step == "amount":
@@ -3162,17 +3647,13 @@ async def text_handler(update, context):
         await handle_withdraw_wallet(update, context, text)
         return
 
-    # ========================================================
-    # ADMIN INPUT (آیدی + مبلغ) - کار در پیوی و گپ
-    # ========================================================
+    # ADMIN INPUT
     if is_owner(user.id):
         handled = await admin_balance_by_id(update, context)
         if handled:
             return
 
-    # ========================================================
-    # ADMIN REPLY-BASED شارژ / کسر - کار در پیوی و گپ
-    # ========================================================
+    # ADMIN REPLY-BASED
     if is_owner(user.id):
         m = re.match(r"^شارژ\s+([0-9]+(?:\.[0-9]+)?)$", text)
         if m:
@@ -3192,9 +3673,7 @@ async def text_handler(update, context):
             await admin_change_by_reply(update, context, "remove", amount)
             return
 
-    # ========================================================
-    # ADMIN BUTTONS (فقط پیوی)
-    # ========================================================
+    # ADMIN BUTTONS (PV only)
     if is_owner(user.id) and message.chat.type == ChatType.PRIVATE:
         if raw_text == "📊 آمار ربات" or raw_text == "📊 آمار":
             await send_admin_stats(update, context)
@@ -3225,6 +3704,26 @@ async def text_handler(update, context):
         if raw_text == "💰 موجودی کاربران":
             await send_admin_balances(update, context)
             return
+        if raw_text == "🚫 بن کاربر":
+            await message.reply_text(
+                "برای بن کاربر:\n"
+                "• روی پیام کاربر ریپلای کنید و بنویسید:\n"
+                "<code>/ban</code>\n"
+                "• یا بنویسید:\n"
+                "<code>/ban 123456789</code>",
+                parse_mode="HTML"
+            )
+            return
+        if raw_text == "✅ آنبن کاربر":
+            await message.reply_text(
+                "برای آنبن:\n"
+                "• روی پیام کاربر ریپلای کنید و بنویسید:\n"
+                "<code>/unban</code>\n"
+                "• یا بنویسید:\n"
+                "<code>/unban 123456789</code>",
+                parse_mode="HTML"
+            )
+            return
         if raw_text == "➕ افزایش پاداش":
             new_reward = get_referral_reward() + Decimal("0.01")
             set_referral_reward(new_reward)
@@ -3247,14 +3746,13 @@ async def text_handler(update, context):
             await send_start_menu(context, message.chat.id, user.id)
             return
 
-    # ========================================================
-    # اگر مالک دکمه‌های ادمین رو توی گپ زد، کیبورد پاک شه
-    # ========================================================
+    # Admin buttons in group
     if is_owner(user.id) and message.chat.type != ChatType.PRIVATE:
         admin_buttons = [
             "📊 آمار ربات", "📊 آمار", "🟢 روشن", "🔴 خاموش",
             "➕ شارژ کاربر", "➕ شارژ", "➖ کسر کاربر", "➖ کسر",
             "🏧 برداشت‌های در انتظار", "💰 موجودی کاربران",
+            "🚫 بن کاربر", "✅ آنبن کاربر",
             "➕ افزایش پاداش", "🏠 منوی اصلی"
         ]
         if raw_text in admin_buttons or raw_text.startswith("➖ کاهش پاداش"):
@@ -3264,9 +3762,7 @@ async def text_handler(update, context):
             )
             return
 
-    # ========================================================
-    # USER BUTTONS (پیوی + گپ)
-    # ========================================================
+    # USER BUTTONS
     if raw_text in ("💰 موجودی", "موجودی", "م", "موجودی من", "balance"):
         await show_balance(update, context)
         return
@@ -3283,9 +3779,7 @@ async def text_handler(update, context):
         await show_help(update, context)
         return
 
-    # ========================================================
     # TRANSFER
-    # ========================================================
     if text.startswith("انتقال"):
         match_id = re.match(
             r"^انتقال\s+([0-9]+(?:\.[0-9]+)?)\s+(\d{5,15})$", text
@@ -3319,9 +3813,7 @@ async def text_handler(update, context):
         )
         return
 
-    # ========================================================
-    # GAME (فقط گپ)
-    # ========================================================
+    # GAME
     game = parse_game(text)
 
     if game == "count_too_high":
@@ -3395,6 +3887,7 @@ def main():
         raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
 
     init_db()
+    auto_ban_invalid_users()
 
     application = (
         Application.builder()
@@ -3413,6 +3906,9 @@ def main():
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("resetgame", reset_game_command))
     application.add_handler(CommandHandler("resetgames", reset_all_games_command))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
+    application.add_handler(CommandHandler("banned", banned_list_command))
 
     application.add_handler(CallbackQueryHandler(
         membership_callback, pattern=r"^check_membership$"
@@ -3470,4 +3966,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
