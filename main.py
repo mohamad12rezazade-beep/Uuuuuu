@@ -53,7 +53,7 @@ MAX_GAME_BET = None
 MAX_GAME_COUNT = 3
 
 DEFAULT_REFERRAL_REWARD = Decimal("0.05")
-MIN_WITHDRAWAL = Decimal("3.2")
+MIN_WITHDRAWAL = Decimal("2")   # ✏️ NEW: حداقل برداشت = ۲
 
 COMMISSION_RATE = Decimal("0.10")
 WIN_MULTIPLIER = Decimal("1.8")
@@ -278,12 +278,6 @@ def is_banned(user_id):
 
 
 def has_invalid_name(user):
-    """
-    True اگر:
-      • اسم خالی باشد
-      • یوزرنیم (پروفایل) خالی باشد
-      • اسم شامل نقطه باشد
-    """
     name = (user.first_name or "").strip()
     username = (user.username or "").strip()
 
@@ -316,7 +310,6 @@ def get_ban_reason(user):
 
 
 def ban_user(user_id, reason="", banned_by=None):
-    """کاربر را بن می‌کند و موجودی‌اش را صفر می‌کند. موجودی قبلی را برمی‌گرداند."""
     with closing(get_db()) as db:
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -362,7 +355,6 @@ def unban_user(user_id):
 
 
 def auto_ban_invalid_users():
-    """کاربران قبلی که شرایط بن را دارند، بن می‌شوند."""
     with closing(get_db()) as db:
         rows = db.execute(
             "SELECT user_id, first_name, username FROM users"
@@ -743,7 +735,6 @@ async def require_captcha_and_membership(update, context):
     if update.callback_query:
         chat = update.callback_query.message.chat
 
-    # 🚫 بن
     if is_banned(user.id):
         if chat and chat.type == ChatType.PRIVATE:
             await safe_send_message(
@@ -754,7 +745,6 @@ async def require_captcha_and_membership(update, context):
             )
         return False
 
-    # 🚫 اسم/پروفایل نامعتبر → بن خودکار
     if has_invalid_name(user):
         if not is_banned(user.id):
             reason = get_ban_reason(user)
@@ -796,7 +786,6 @@ async def require_captcha_and_membership(update, context):
                 )
         return False
 
-    # در گپ‌ها کپچا لازم نیست
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         return True
 
@@ -935,7 +924,7 @@ async def captcha_callback(update, context):
 
 
 # ============================================================
-# REFERRAL GRANT (با پیام تضمینی)
+# REFERRAL GRANT
 # ============================================================
 
 async def try_grant_referral(user_id, context):
@@ -1003,7 +992,6 @@ async def try_grant_referral(user_id, context):
             logger.exception("Referral insert failed")
             return
 
-    # 🔔 پیام به معرف
     try:
         with closing(get_db()) as db:
             r = db.execute(
@@ -1031,7 +1019,6 @@ async def try_grant_referral(user_id, context):
     except Exception:
         logger.warning("Referral PV notify failed")
 
-    # 🔔 پیام به کاربر جدید
     try:
         await safe_send_message(
             context.bot, user_id,
@@ -1128,7 +1115,6 @@ async def start(update, context):
 
     chat = update.effective_chat
 
-    # 🚫 بن / اسم نامعتبر
     if not is_owner(user.id):
         if is_banned(user.id):
             if chat and chat.type == ChatType.PRIVATE:
@@ -1169,7 +1155,6 @@ async def start(update, context):
                         pass
             return
 
-    # ثبت رفرال
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
@@ -1457,7 +1442,6 @@ async def transfer_by_id(update, context, amount, target_id):
         await message.reply_text("❌ این کاربر بن است.")
         return
 
-    # چک وجود کاربر واقعی
     with closing(get_db()) as db:
         row = db.execute(
             "SELECT user_id FROM users WHERE user_id = ?", (target_id,)
@@ -2169,7 +2153,6 @@ async def ban_command(update, context):
 
     target_name = safe_name(get_user_display_name(target_id))
 
-    # 💬 پیام در چت جاری (گروه یا پیوی)
     await message.reply_text(
         "🚫 <b>کاربر از ربات بن شد!</b>\n\n"
         f"👤 {target_name}\n"
@@ -2179,7 +2162,6 @@ async def ban_command(update, context):
         parse_mode="HTML"
     )
 
-    # 💬 پیام در پیوی کاربر
     try:
         await safe_send_message(
             context.bot, target_id,
@@ -2191,7 +2173,6 @@ async def ban_command(update, context):
     except Exception:
         logger.warning("Could not notify banned user %s", target_id)
 
-    # 🔔 پیام به مالک در پیوی
     try:
         await safe_send_message(
             context.bot, OWNER_ID,
@@ -2352,7 +2333,6 @@ async def withdraw_callback(update, context):
                     (wd_user_id,)
                 ).fetchone()
                 if not row:
-                    # کاربر نیست → برگرداندن پول به حساب شبح نمی‌شود، پس رد کن
                     db.rollback()
                     try:
                         await query.answer("❌ کاربر پیدا نشد.", show_alert=True)
@@ -3673,6 +3653,132 @@ async def text_handler(update, context):
             await admin_change_by_reply(update, context, "remove", amount)
             return
 
+    # ============================================================
+    # ✏️ NEW: بن با کلمه ساده (بدون اسلش) — با ریپلای یا آیدی
+    # ============================================================
+    if raw_text == "بن" or raw_text.startswith("بن "):
+        if not is_owner(user.id):
+            await message.reply_text("❌ فقط مالک ربات می‌تونه بن کنه.")
+            return
+
+        target_id = None
+
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_id = message.reply_to_message.from_user.id
+        else:
+            m = re.match(r"^بن\s+(\d{5,15})$", text)
+            if m:
+                target_id = int(m.group(1))
+
+        if not target_id:
+            await message.reply_text(
+                "❌ روش استفاده:\n\n"
+                "1️⃣ روی پیام کاربر ریپلای کن و بنویس:\n"
+                "<code>بن</code>\n\n"
+                "2️⃣ یا با آیدی عددی:\n"
+                "<code>بن 123456789</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        if target_id == user.id:
+            await message.reply_text("❌ نمی‌تونی خودت رو بن کنی.")
+            return
+
+        if is_banned(target_id):
+            await message.reply_text("ℹ️ این کاربر از قبل بن شده.")
+            return
+
+        old_balance = ban_user(target_id, reason="owner_ban", banned_by=user.id)
+
+        if old_balance is None:
+            await message.reply_text("❌ خطا در بن.")
+            return
+
+        target_name = safe_name(get_user_display_name(target_id))
+
+        await message.reply_text(
+            "🚫 <b>کاربر بن شد!</b>\n\n"
+            f"👤 {target_name}\n"
+            f"🆔 <code>{target_id}</code>\n"
+            f"💰 موجودی صفر شد: <b>{money(old_balance)} {CURRENCY}</b>",
+            parse_mode="HTML"
+        )
+
+        try:
+            await safe_send_message(
+                context.bot, target_id,
+                "🚫 <b>شما از ربات بن شدید!</b>\n\n"
+                f"💰 موجودی شما ({money(old_balance)} {CURRENCY}) صفر شد.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        return
+
+    # ============================================================
+    # ✏️ NEW: حذف بن با کلمه «حذف بن» — با ریپلای یا آیدی
+    # ============================================================
+    if raw_text.startswith("حذف بن"):
+        if not is_owner(user.id):
+            await message.reply_text("❌ فقط مالک ربات می‌تونه بن رو حذف کنه.")
+            return
+
+        target_id = None
+
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_id = message.reply_to_message.from_user.id
+        else:
+            m = re.match(r"^حذف\s*بن\s+(\d{5,15})$", text)
+            if m:
+                target_id = int(m.group(1))
+
+        if not target_id:
+            await message.reply_text(
+                "❌ روش استفاده:\n\n"
+                "1️⃣ روی پیام کاربر ریپلای کن و بنویس:\n"
+                "<code>حذف بن</code>\n\n"
+                "2️⃣ یا با آیدی عددی:\n"
+                "<code>حذف بن 123456789</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        if not is_banned(target_id):
+            await message.reply_text(
+                f"ℹ️ کاربر <code>{target_id}</code> بن نیست.",
+                parse_mode="HTML"
+            )
+            return
+
+        unban_user(target_id)
+
+        target_name = safe_name(get_user_display_name(target_id))
+
+        await message.reply_text(
+            "✅ <b>کاربر از بن خارج شد!</b>\n\n"
+            f"👤 {target_name}\n"
+            f"🆔 <code>{target_id}</code>\n\n"
+            "⚠️ اگر هنوز اسم یا پروفایل نداشته باشد،\n"
+            "با اولین /start دوباره بن می‌شود.",
+            parse_mode="HTML"
+        )
+
+        try:
+            await safe_send_message(
+                context.bot, target_id,
+                "✅ <b>شما از بن خارج شدید!</b>\n\n"
+                "حالا می‌تونید از ربات استفاده کنید.\n"
+                "⚠️ اگر اسم (بدون نقطه) یا پروفایل نداشته باشید، دوباره بن می‌شوید.",
+                parse_mode="HTML",
+                reply_markup=main_keyboard()
+            )
+        except Exception:
+            logger.warning("Could not notify unbanned user %s", target_id)
+
+        return
+
     # ADMIN BUTTONS (PV only)
     if is_owner(user.id) and message.chat.type == ChatType.PRIVATE:
         if raw_text == "📊 آمار ربات" or raw_text == "📊 آمار":
@@ -3708,9 +3814,9 @@ async def text_handler(update, context):
             await message.reply_text(
                 "برای بن کاربر:\n"
                 "• روی پیام کاربر ریپلای کنید و بنویسید:\n"
-                "<code>/ban</code>\n"
+                "<code>/ban</code> یا <code>بن</code>\n"
                 "• یا بنویسید:\n"
-                "<code>/ban 123456789</code>",
+                "<code>/ban 123456789</code> یا <code>بن 123456789</code>",
                 parse_mode="HTML"
             )
             return
@@ -3718,9 +3824,9 @@ async def text_handler(update, context):
             await message.reply_text(
                 "برای آنبن:\n"
                 "• روی پیام کاربر ریپلای کنید و بنویسید:\n"
-                "<code>/unban</code>\n"
+                "<code>/unban</code> یا <code>حذف بن</code>\n"
                 "• یا بنویسید:\n"
-                "<code>/unban 123456789</code>",
+                "<code>/unban 123456789</code> یا <code>حذف بن 123456789</code>",
                 parse_mode="HTML"
             )
             return
