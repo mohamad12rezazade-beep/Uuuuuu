@@ -37,7 +37,7 @@ GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
 # ⚠️ لینک دیتابیس Supabase (رمز جدیدت رو اینجا بذار)
-DATABASE_URL = "postgresql://postgres.pqvuttwpkmhjhnccflxi:Ali1365277356@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
+DATABASE_URL = "postgresql://postgres.pqvuttwpkmhjhnccflxi:Ali1365277356@aws-0-ap-south-1.pooler.supabase.com:6543/postgres"
 
 CURRENCY = "TRX"
 MIN_GAME_BET = Decimal("0.1")
