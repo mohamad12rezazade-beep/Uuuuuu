@@ -9,6 +9,7 @@ from html import escape as html_escape
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+import aiohttp
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -500,18 +501,82 @@ async def start(update, context):
         await try_grant_referral(user.id, context)
     await send_start_menu(context, update.effective_chat.id, user.id)
 
+# ============================================================
+# ✏️ تابع موجودی با قیمت لحظه‌ای
+# ============================================================
 async def show_balance(update, context, target=None):
     user = update.effective_user
     ensure_user(user)
-    text = f"💰 موجودی شما\n\n{money(get_balance(user.id))} {CURRENCY}"
-    if target: await safe_send_message(context.bot, target, text)
-    elif update.callback_query:
-        try: await update.callback_query.edit_message_text(text)
-        except: pass
+    
+    balance = get_balance(user.id)
+    balance_str = money(balance)
+    
+    trx_usd = None
+    usdt_toman = None
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    trx_usd = Decimal(str(data["tron"]["usd"]))
+    except Exception:
+        pass
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://nerkh.jahankhahan.shop/data/live.json",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    usdt_toman = Decimal(str(data["rates"].get("tether", 0)))
+    except Exception:
+        pass
+    
+    if trx_usd:
+        usd_value = balance * trx_usd
+        usd_str = f"${usd_value:.4f}"
     else:
-        kwargs = {"reply_to_message_id": update.message.message_id}
-        if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+        usd_str = "در دسترس نیست"
+    
+    if trx_usd and usdt_toman and usdt_toman > 0:
+        toman_value = balance * trx_usd * usdt_toman
+        toman_str = f"{toman_value:,.0f} تومان"
+    else:
+        toman_str = "در دسترس نیست"
+    
+    name = user.first_name or "کاربر"
+    text = (
+        f"╭━━━ 👤 BET_TEK 🎮 ━━━╮\n\n"
+        f"👤 {safe_name(name)}\n"
+        f"🆔 #{user.id}\n\n"
+        f"💰 موجودی شما\n"
+        f"┌─────────────────┐\n"
+        f"│  {balance_str} TRX\n"
+        f"└─────────────────┘\n"
+        f"💵 {usd_str}\n"
+        f"💸 {toman_str}\n\n"
+        f"╰━━━━━━━━━━━━━━━━━╯"
+    )
+    
+    if target:
+        await safe_send_message(context.bot, target, text, parse_mode="HTML")
+    elif update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, parse_mode="HTML")
+        except:
+            pass
+    else:
+        kwargs = {"reply_to_message_id": update.message.message_id, "parse_mode": "HTML"}
+        if update.message.chat.type != ChatType.PRIVATE:
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
         await update.message.reply_text(text, **kwargs)
+# ============================================================
 
 async def show_my_id(update, context, target=None):
     user = update.effective_user
@@ -921,7 +986,6 @@ async def create_game(update, context, count, game_type, bet):
     if bet < MIN_GAME_BET: await update.message.reply_text(f"❌ حداقل شرط {money(MIN_GAME_BET)} {CURRENCY} است."); return
     if MAX_GAME_BET is not None and bet > MAX_GAME_BET: await update.message.reply_text(f"❌ حداکثر شرط {money(MAX_GAME_BET)} {CURRENCY} است."); return
     
-    # ✏️ تغییر: پیام مناسب وقتی کاربر بازی فعال دارد
     active = get_active_game_for_user(chat.id, user.id)
     if active: 
         await update.message.reply_text(
@@ -969,7 +1033,6 @@ async def join_game_callback(update, context):
                 if game["creator_id"] == user.id:
                     db.rollback(); await query.answer("❌ نمی‌توانید با خودتان بازی کنید.", show_alert=True); return
                 
-                # ✏️ چک کردن اینکه کاربر دیگری بازی فعال نداشته باشد
                 cursor.execute("SELECT id FROM games WHERE chat_id = %s AND status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND (creator_id = %s OR opponent_id = %s) LIMIT 1", (game["chat_id"], user.id, user.id))
                 if cursor.fetchone():
                     db.rollback(); await query.answer("⏳ شما در یک بازی دیگر مشغول هستید!", show_alert=True); return
