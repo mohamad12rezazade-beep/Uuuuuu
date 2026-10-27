@@ -35,7 +35,7 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
-# ⚠️ لینک دیتابیس Supabase
+# ⚠️ لینک دیتابیس Supabase (رمز جدیدت رو اینجا بذار)
 DATABASE_URL = "postgresql://postgres.pqvuttwpkmhjhnccflxi:Ali1365277356@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
 
 CURRENCY = "TRX"
@@ -920,7 +920,17 @@ async def create_game(update, context, count, game_type, bet):
     if not bot_enabled(): await update.message.reply_text("🔴 ربات خاموش است."); return
     if bet < MIN_GAME_BET: await update.message.reply_text(f"❌ حداقل شرط {money(MIN_GAME_BET)} {CURRENCY} است."); return
     if MAX_GAME_BET is not None and bet > MAX_GAME_BET: await update.message.reply_text(f"❌ حداکثر شرط {money(MAX_GAME_BET)} {CURRENCY} است."); return
-    if get_active_game_for_user(chat.id, user.id): await update.message.reply_text("❌ شما در حال حاضر یک بازی فعال دارید."); return
+    
+    # ✏️ تغییر: پیام مناسب وقتی کاربر بازی فعال دارد
+    active = get_active_game_for_user(chat.id, user.id)
+    if active: 
+        await update.message.reply_text(
+            "⏳ <b>شما در حال حاضر در یک بازی مشغول هستید.</b>\n\n"
+            "پس از تمام شدن بازی فعلی، می‌توانید بازی جدید بسازید.",
+            parse_mode="HTML"
+        )
+        return
+        
     try: change_balance(user.id, -bet, "game_bet", f"Game {game_type}")
     except ValueError:
         await update.message.reply_text(f"❌ موجودی شما کافی نیست.\n\n💰 موجودی: {money(get_balance(user.id))} {CURRENCY}"); return
@@ -958,6 +968,12 @@ async def join_game_callback(update, context):
                     db.rollback(); await query.answer("❌ بازی دیگر فعال نیست.", show_alert=True); return
                 if game["creator_id"] == user.id:
                     db.rollback(); await query.answer("❌ نمی‌توانید با خودتان بازی کنید.", show_alert=True); return
+                
+                # ✏️ چک کردن اینکه کاربر دیگری بازی فعال نداشته باشد
+                cursor.execute("SELECT id FROM games WHERE chat_id = %s AND status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND (creator_id = %s OR opponent_id = %s) LIMIT 1", (game["chat_id"], user.id, user.id))
+                if cursor.fetchone():
+                    db.rollback(); await query.answer("⏳ شما در یک بازی دیگر مشغول هستید!", show_alert=True); return
+                
                 bet = Decimal(game["bet"])
                 cursor.execute("SELECT balance FROM users WHERE user_id = %s FOR UPDATE", (user.id,))
                 row = cursor.fetchone()
@@ -1313,7 +1329,7 @@ async def error_handler(update, context):
 
 def main():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
-    init_db_pool() # <--- این خط سرعت ربات رو بالا می‌بره
+    init_db_pool() 
     init_db()
     auto_ban_invalid_users()
     application = (Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30).build())
