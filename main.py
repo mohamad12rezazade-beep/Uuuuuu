@@ -4,17 +4,18 @@ import random
 import logging
 import asyncio
 from decimal import Decimal, InvalidOperation
-from contextlib import closing
+from contextlib import closing, contextmanager
 from html import escape as html_escape
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 from telegram.constants import ChatType
-from telegram.error import TimedOut, NetworkError, TelegramError
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
@@ -34,7 +35,7 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
-# ⚠️ لینک دیتابیس Supabase (رمز: Ali1365277356)
+# ⚠️ لینک دیتابیس Supabase
 DATABASE_URL = "postgresql://postgres.pqvuttwpkmhjhnccflxi:Ali1365277356@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
 
 CURRENCY = "TRX"
@@ -55,14 +56,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("BET_BT")
 
 # ============================================================
-# DATABASE (POSTGRESQL)
+# DATABASE (POSTGRESQL WITH POOLING)
 # ============================================================
 
+db_pool = None
+
+def init_db_pool():
+    global db_pool
+    if db_pool is None:
+        try:
+            db_pool = psycopg2.pool.SimpleConnectionPool(1, 15, DATABASE_URL, sslmode='require')
+            logger.info("Database pool created.")
+        except Exception as e:
+            logger.error(f"Error creating DB pool: {e}")
+
+@contextmanager
 def get_db():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+    global db_pool
+    if db_pool is None: init_db_pool()
+    conn = db_pool.getconn()
+    try:
+        yield conn
+    finally:
+        db_pool.putconn(conn)
 
 def init_db():
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '', balance TEXT NOT NULL DEFAULT '0', referrer_id BIGINT DEFAULT NULL, captcha_verified INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
             cursor.execute("CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, type TEXT NOT NULL, amount TEXT NOT NULL, description TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -113,7 +132,7 @@ def is_valid_trx_address(addr):
     return bool(re.match(r"^T[A-Za-z0-9]{33}$", str(addr).strip()))
 
 def is_banned(user_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT user_id FROM banned_users WHERE user_id = %s", (user_id,))
             return bool(cursor.fetchone())
@@ -133,7 +152,7 @@ def get_ban_reason(user):
     return "نامعتبر"
 
 def ban_user(user_id, reason="", banned_by=None, zero_balance=False):
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
@@ -154,13 +173,13 @@ def ban_user(user_id, reason="", banned_by=None, zero_balance=False):
             return None
 
 def unban_user(user_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
             db.commit()
 
 def auto_ban_invalid_users():
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT user_id, first_name, username FROM users")
             rows = cursor.fetchall()
@@ -182,26 +201,26 @@ def auto_ban_invalid_users():
 
 def ensure_user(user):
     if not user: return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("INSERT INTO users(user_id, username, first_name, balance) VALUES (%s, %s, %s, '0') ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, first_name = EXCLUDED.first_name", (user.id, user.username or "", user.first_name or ""))
             db.commit()
 
 def ensure_user_id(user_id, first_name="", username=""):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("INSERT INTO users(user_id, username, first_name, balance) VALUES (%s, %s, %s, '0') ON CONFLICT (user_id) DO NOTHING", (user_id, username or "", first_name or ""))
             db.commit()
 
 def get_balance(user_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
             return Decimal(row["balance"]) if row else Decimal("0")
 
 def get_user_display_name(user_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT first_name, username FROM users WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
@@ -214,20 +233,20 @@ def user_tag(user_id):
     return f'<a href="tg://user?id={user_id}">{safe_name(get_user_display_name(user_id))}</a>'
 
 def is_captcha_verified(user_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT captcha_verified FROM users WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
             return bool(row and row["captcha_verified"] == 1)
 
 def set_captcha_verified(user_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("UPDATE users SET captcha_verified = 1 WHERE user_id = %s", (user_id,))
             db.commit()
 
 def get_referral_reward():
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT value FROM settings WHERE key = 'referral_reward'")
             row = cursor.fetchone()
@@ -237,14 +256,14 @@ def get_referral_reward():
     return DEFAULT_REFERRAL_REWARD
 
 def set_referral_reward(value):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("INSERT INTO settings(key, value) VALUES ('referral_reward', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (str(value),))
             db.commit()
 
 def change_balance(user_id, amount, transaction_type, description=""):
     amount = Decimal(str(amount))
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT balance FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
@@ -262,14 +281,14 @@ def change_balance(user_id, amount, transaction_type, description=""):
             raise
 
 def bot_enabled():
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT value FROM settings WHERE key = 'bot_enabled'")
             row = cursor.fetchone()
             return bool(row and row["value"] == "1")
 
 def set_bot_enabled(enabled):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("INSERT INTO settings(key, value) VALUES ('bot_enabled', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", ("1" if enabled else "0",))
             db.commit()
@@ -418,7 +437,7 @@ async def captcha_callback(update, context):
     await send_start_menu(context, query.message.chat_id, user.id)
 
 async def try_grant_referral(user_id, context):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT referrer_id FROM users WHERE user_id = %s", (user_id,))
             row = cursor.fetchone()
@@ -428,7 +447,7 @@ async def try_grant_referral(user_id, context):
             if cursor.fetchone(): return
     if not is_captcha_verified(user_id) or not await check_membership(user_id, context): return
     reward_amount = get_referral_reward()
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor() as cursor:
                 cursor.execute("INSERT INTO referrals(referrer_id, referred_id, reward) VALUES (%s, %s, %s) ON CONFLICT (referred_id) DO NOTHING", (referrer_id, user_id, str(reward_amount)))
@@ -470,7 +489,7 @@ async def start(update, context):
         try: referrer_id = int(context.args[0].replace("ref_", ""))
         except: referrer_id = None
         if referrer_id and referrer_id != user.id:
-            with closing(get_db()) as db:
+            with get_db() as db:
                 with db.cursor() as cursor:
                     cursor.execute("UPDATE users SET referrer_id = %s WHERE user_id = %s AND referrer_id IS NULL", (referrer_id, user.id))
                     db.commit()
@@ -513,7 +532,7 @@ async def show_referral(update, context, target=None):
     try: username = (await context.bot.get_me()).username
     except: username = None
     link = f"https://t.me/{username}?start=ref_{user.id}" if username else "لینک در دسترس نیست."
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user.id,))
             total = cursor.fetchone()[0]
@@ -556,7 +575,7 @@ async def transfer_by_id(update, context, amount, target_id):
     user, message = update.effective_user, update.message
     if target_id == user.id or target_id <= 0 or is_banned(target_id):
         await message.reply_text("❌ انتقال نامعتبر."); return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
             if not cursor.fetchone(): await message.reply_text("❌ کاربر ربات را استارت نکرده."); return
@@ -606,7 +625,7 @@ async def handle_withdraw_wallet(update, context, wallet):
         context.user_data.pop("withdraw_step", None); context.user_data.pop("withdraw_amount", None)
         await message.reply_text("❌ خطا. دوباره تلاش کنید."); return
     context.user_data.pop("withdraw_step", None); context.user_data.pop("withdraw_amount", None)
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("SELECT id FROM withdrawals WHERE user_id = %s AND status = 'pending' LIMIT 1", (user.id,))
             if cursor.fetchone(): await message.reply_text("❌ شما یک درخواست برداشت در انتظار دارید.\nلطفاً تا بررسی آن صبر کنید.", reply_markup=main_keyboard()); return
@@ -616,7 +635,7 @@ async def handle_withdraw_wallet(update, context, wallet):
     except Exception:
         logger.exception("Withdraw deduction failed"); await message.reply_text("❌ خطا در برداشت.", reply_markup=main_keyboard()); return
     try:
-        with closing(get_db()) as db:
+        with get_db() as db:
             with db.cursor() as cursor:
                 cursor.execute("INSERT INTO withdrawals(user_id, amount, wallet) VALUES (%s, %s, %s) RETURNING id", (user.id, str(amount), wallet))
                 wid = cursor.fetchone()[0]; db.commit()
@@ -701,7 +720,7 @@ async def admin_change_by_reply(update, context, operation, amount):
 async def send_admin_stats(update, context):
     user = update.effective_user
     if not is_owner(user.id): return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT COUNT(*) AS c FROM users"); users = cursor.fetchone()["c"]
             cursor.execute("SELECT COALESCE(SUM(CAST(balance AS NUMERIC)), 0) AS total FROM users"); total = float(cursor.fetchone()["total"] or 0)
@@ -715,7 +734,7 @@ async def send_admin_stats(update, context):
 async def send_admin_withdrawals(update, context):
     user = update.effective_user
     if not is_owner(user.id): return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY id ASC LIMIT 10")
             rows = cursor.fetchall()
@@ -728,7 +747,7 @@ async def send_admin_withdrawals(update, context):
 async def send_admin_balances(update, context):
     user = update.effective_user
     if not is_owner(user.id): return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT user_id, username, first_name, balance FROM users ORDER BY CAST(balance AS NUMERIC) DESC, user_id ASC")
             rows = cursor.fetchall()
@@ -780,7 +799,7 @@ async def unban_command(update, context):
 async def banned_list_command(update, context):
     user = update.effective_user
     if not is_owner(user.id): return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT b.user_id, b.reason, b.banned_at, u.first_name, u.username FROM banned_users b LEFT JOIN users u ON u.user_id = b.user_id ORDER BY b.banned_at DESC LIMIT 50")
             rows = cursor.fetchall()
@@ -803,7 +822,7 @@ async def withdraw_callback(update, context):
         return
     try: _, action, wd_id = query.data.split("_"); wd_id = int(wd_id)
     except: return
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT * FROM withdrawals WHERE id = %s FOR UPDATE", (wd_id,))
@@ -836,7 +855,7 @@ async def wd_proof_callback(update, context):
         return
     try: wd_id = int(query.data.replace("wd_proof_", ""))
     except: return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT * FROM withdrawals WHERE id = %s", (wd_id,))
             wd = cursor.fetchone()
@@ -875,13 +894,13 @@ def parse_game(text):
     return (count, GAME_NAMES[name], bet)
 
 def get_active_game_for_user(chat_id, user_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT * FROM games WHERE chat_id = %s AND status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND (creator_id = %s OR opponent_id = %s) ORDER BY id DESC LIMIT 1", (chat_id, user_id, user_id))
             return cursor.fetchone()
 
 def get_game(game_id):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             cursor.execute("SELECT * FROM games WHERE id = %s", (game_id,))
             return cursor.fetchone()
@@ -905,7 +924,7 @@ async def create_game(update, context, count, game_type, bet):
     try: change_balance(user.id, -bet, "game_bet", f"Game {game_type}")
     except ValueError:
         await update.message.reply_text(f"❌ موجودی شما کافی نیست.\n\n💰 موجودی: {money(get_balance(user.id))} {CURRENCY}"); return
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor() as cursor:
                 cursor.execute("INSERT INTO games(chat_id, creator_id, game_type, count, bet, mode, status, creator_total, opponent_total, creator_rolls, opponent_rolls) VALUES (%s, %s, %s, %s, %s, 'friends', 'waiting', 0, 0, 0, 0) RETURNING id", (chat.id, user.id, game_type, count, str(bet)))
@@ -918,7 +937,7 @@ async def create_game(update, context, count, game_type, bet):
     emoji, name = GAME_INFO[game_type]
     sent = await update.message.reply_text(f"🎮 بازی جدید\n\n{emoji} {name}\n🔢 تعداد: {count}\n💰 شرط: {money(bet)} {CURRENCY}\n👤 سازنده: {safe_name(user.first_name or user.id)}\n\nیکی از گزینه‌ها را انتخاب کنید.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 بازی با دوستان", callback_data=f"join_{game_id}")], [InlineKeyboardButton("🤖 بازی با ربات", callback_data=f"bot_{game_id}")], [InlineKeyboardButton("❌ لغو بازی", callback_data=f"cancel_{game_id}")]]))
     if sent:
-        with closing(get_db()) as db:
+        with get_db() as db:
             with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
 
 async def join_game_callback(update, context):
@@ -930,7 +949,7 @@ async def join_game_callback(update, context):
     try: game_id = int(query.data.replace("join_", ""))
     except: return
     ensure_user(user)
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
@@ -954,7 +973,7 @@ async def join_game_callback(update, context):
     emoji, name = GAME_INFO[game["game_type"]]
     sent = await safe_send_message(context.bot, query.message.chat_id, f"🎮 بازی دوستان شروع شد!\n\n{emoji} {name}\n🔢 تعداد پرتاب: {game['count']}\n💰 شرط هر نفر: {money(bet)} {CURRENCY}\n\n👤 {user_tag(game['creator_id'])}\n👤 {user_tag(user.id)}\n\n🎯 نوبت {user_tag(game['creator_id'])} است.\n{emoji} را {game['count']} بار بفرستید.", parse_mode="HTML")
     if sent:
-        with closing(get_db()) as db:
+        with get_db() as db:
             with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
 
 async def bot_game_callback(update, context):
@@ -965,7 +984,7 @@ async def bot_game_callback(update, context):
         return
     try: game_id = int(query.data.replace("bot_", ""))
     except: return
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
@@ -980,14 +999,14 @@ async def bot_game_callback(update, context):
     emoji, name = GAME_INFO[game["game_type"]]
     sent = await safe_send_message(context.bot, query.message.chat_id, f"🤖 بازی با ربات شروع شد!\n\n{emoji} {name}\n🔢 تعداد پرتاب: {game['count']}\n💰 شرط: {money(Decimal(game['bet']))} {CURRENCY}\n\n🎯 نوبت {user_tag(user.id)} است.\n\n{emoji} را {game['count']} بار بفرستید.", parse_mode="HTML")
     if sent:
-        with closing(get_db()) as db:
+        with get_db() as db:
             with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
 
 async def cancel_game_callback(update, context):
     query, user = update.callback_query, update.callback_query.from_user
     try: game_id = int(query.data.replace("cancel_", ""))
     except: return
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
@@ -1016,7 +1035,7 @@ async def user_game_dice_handler(update, context):
 
     if game["status"] == "creator_turn":
         if user.id != game["creator_id"]: return
-        with closing(get_db()) as db:
+        with get_db() as db:
             try:
                 with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                     cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game["id"],))
@@ -1040,7 +1059,7 @@ async def user_game_dice_handler(update, context):
 
     if game["status"] == "opponent_turn":
         if user.id != game["opponent_id"]: return
-        with closing(get_db()) as db:
+        with get_db() as db:
             try:
                 with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                     cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game["id"],))
@@ -1068,7 +1087,7 @@ async def bot_roll_game(context, game_id):
             await reset_game_internal(context, game_id, reason="bot_roll_failed"); return None
         try: total += dice_to_points(game["game_type"], msg.dice.value)
         except: pass
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor() as cursor:
                 cursor.execute("UPDATE games SET opponent_total = %s, opponent_rolls = %s, status = 'finishing' WHERE id = %s AND status = 'bot_turn'", (total, int(game["count"]), game_id))
@@ -1081,7 +1100,7 @@ async def finish_game(context, game_id):
     chat_id = game_type = creator_id = opponent_id = mode = result_type = winner_id = loser_id = None
     bet = payout_value = commission_value = refund_value = Decimal("0")
     creator_total = opponent_total = 0
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
@@ -1145,7 +1164,7 @@ async def send_pv_result(context, user_id, game_name, header, detail):
     except: pass
 
 async def reset_game_internal(context, game_id, reason="manual"):
-    with closing(get_db()) as db:
+    with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
@@ -1171,7 +1190,7 @@ async def reset_game_command(update, context):
         try: game_id = int(normalize_digits(context.args[0]))
         except: await update.message.reply_text("❌ آیدی بازی صحیح نیست.\nمثال:\n/resetgame 25"); return
     else:
-        with closing(get_db()) as db:
+        with get_db() as db:
             with db.cursor() as cursor:
                 cursor.execute("SELECT id FROM games WHERE chat_id = %s AND status NOT IN ('finished', 'cancelled', 'reset') ORDER BY id DESC LIMIT 1", (chat.id,))
                 row = cursor.fetchone()
@@ -1183,7 +1202,7 @@ async def reset_game_command(update, context):
 async def reset_all_games_command(update, context):
     user = update.effective_user
     if not is_owner(user.id): await update.message.reply_text("❌ فقط مالک."); return
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("SELECT id FROM games WHERE status NOT IN ('finished', 'cancelled', 'reset')")
             rows = cursor.fetchall()
@@ -1191,7 +1210,7 @@ async def reset_all_games_command(update, context):
     await update.message.reply_text(f"♻️ ریست انجام شد.\n🎮 تعداد: {count}")
 
 async def cleanup_old_games(context):
-    with closing(get_db()) as db:
+    with get_db() as db:
         with db.cursor() as cursor:
             cursor.execute("SELECT id FROM games WHERE status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND created_at < NOW() - INTERVAL '%s minutes'", (GAME_TIMEOUT_MINUTES,))
             rows = cursor.fetchall()
@@ -1294,6 +1313,7 @@ async def error_handler(update, context):
 
 def main():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
+    init_db_pool() # <--- این خط سرعت ربات رو بالا می‌بره
     init_db()
     auto_ban_invalid_users()
     application = (Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30).build())
