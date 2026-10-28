@@ -1,3 +1,5 @@
-python-telegram-bot[job-queue]
+python-telegram-bot[job-queue,webhooks]
 psycopg2-binary
 aiohttp
+uvicorn
+fastapi
