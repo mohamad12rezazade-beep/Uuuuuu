@@ -3,6 +3,7 @@ import re
 import random
 import logging
 import asyncio
+import time
 from decimal import Decimal, InvalidOperation
 from contextlib import closing, contextmanager
 from html import escape as html_escape
@@ -13,7 +14,7 @@ import aiohttp
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 )
 from telegram.constants import ChatType
 from telegram.error import TimedOut, NetworkError
@@ -36,7 +37,7 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
-# ⚠️ لینک دیتابیس Supabase (رمز جدیدت رو اینجا بذار)
+# ⚠️ لینک دیتابیس (پورت 6543 برای سرعت بالا تنظیم شد)
 DATABASE_URL = "postgresql://postgres.pqvuttwpkmhjhnccflxi:Ali1365277356@aws-0-ap-south-1.pooler.supabase.com:6543/postgres"
 
 CURRENCY = "TRX"
@@ -52,6 +53,9 @@ GAME_TIMEOUT_MINUTES = 30
 PENDING_PROOF: dict = {}
 PENDING_CAPTCHA: dict = {}
 DOT_CHARS = [".", "۔", "•", "·", "⋅", "٫", "٬", "。", "｡", "…"]
+
+# کش قیمت‌ها برای جلوگیری از تاخیر
+PRICE_CACHE = {"trx_usd": None, "usdt_toman": None, "last_update": 0}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("BET_BT")
@@ -502,7 +506,7 @@ async def start(update, context):
     await send_start_menu(context, update.effective_chat.id, user.id)
 
 # ============================================================
-# ✏️ تابع موجودی با قیمت لحظه‌ای
+# ✏️ تابع موجودی با قیمت لحظه‌ای (با کش)
 # ============================================================
 async def show_balance(update, context, target=None):
     user = update.effective_user
@@ -511,32 +515,35 @@ async def show_balance(update, context, target=None):
     balance = get_balance(user.id)
     balance_str = money(balance)
     
-    trx_usd = None
-    usdt_toman = None
+    global PRICE_CACHE
+    now = time.time()
     
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    trx_usd = Decimal(str(data["tron"]["usd"]))
-    except Exception:
-        pass
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://nerkh.jahankhahan.shop/data/live.json",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    usdt_toman = Decimal(str(data["rates"].get("tether", 0)))
-    except Exception:
-        pass
+    if now - PRICE_CACHE["last_update"] > 300 or PRICE_CACHE["trx_usd"] is None:
+        trx_usd = None
+        usdt_toman = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        trx_usd = Decimal(str(data["tron"]["usd"]))
+        except: pass
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://nerkh.jahankhahan.shop/data/live.json", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        usdt_toman = Decimal(str(data["rates"].get("tether", 0)))
+        except: pass
+        
+        if trx_usd:
+            PRICE_CACHE["trx_usd"] = trx_usd
+            PRICE_CACHE["usdt_toman"] = usdt_toman
+            PRICE_CACHE["last_update"] = now
+            
+    trx_usd = PRICE_CACHE["trx_usd"]
+    usdt_toman = PRICE_CACHE["usdt_toman"]
     
     if trx_usd:
         usd_value = balance * trx_usd
@@ -569,14 +576,12 @@ async def show_balance(update, context, target=None):
     elif update.callback_query:
         try:
             await update.callback_query.edit_message_text(text, parse_mode="HTML")
-        except:
-            pass
+        except: pass
     else:
         kwargs = {"reply_to_message_id": update.message.message_id, "parse_mode": "HTML"}
         if update.message.chat.type != ChatType.PRIVATE:
             kwargs["reply_markup"] = ReplyKeyboardRemove()
         await update.message.reply_text(text, **kwargs)
-# ============================================================
 
 async def show_my_id(update, context, target=None):
     user = update.effective_user
@@ -690,25 +695,30 @@ async def handle_withdraw_wallet(update, context, wallet):
         context.user_data.pop("withdraw_step", None); context.user_data.pop("withdraw_amount", None)
         await message.reply_text("❌ خطا. دوباره تلاش کنید."); return
     context.user_data.pop("withdraw_step", None); context.user_data.pop("withdraw_amount", None)
+    
+    # بررسی و کسر در یک تراکنش
     with get_db() as db:
-        with db.cursor() as cursor:
-            cursor.execute("SELECT id FROM withdrawals WHERE user_id = %s AND status = 'pending' LIMIT 1", (user.id,))
-            if cursor.fetchone(): await message.reply_text("❌ شما یک درخواست برداشت در انتظار دارید.\nلطفاً تا بررسی آن صبر کنید.", reply_markup=main_keyboard()); return
-    try: change_balance(user.id, -amount, "withdraw", f"Withdraw {wallet[:10]}...")
-    except ValueError:
-        await message.reply_text("❌ موجودی کافی نیست.", reply_markup=main_keyboard()); return
-    except Exception:
-        logger.exception("Withdraw deduction failed"); await message.reply_text("❌ خطا در برداشت.", reply_markup=main_keyboard()); return
-    try:
-        with get_db() as db:
-            with db.cursor() as cursor:
+        try:
+            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("SELECT id FROM withdrawals WHERE user_id = %s AND status = 'pending' LIMIT 1", (user.id,))
+                if cursor.fetchone(): 
+                    await message.reply_text("❌ شما یک درخواست برداشت در انتظار دارید.\nلطفاً تا بررسی آن صبر کنید.", reply_markup=main_keyboard())
+                    return
+                
+                cursor.execute("SELECT balance FROM users WHERE user_id = %s FOR UPDATE", (user.id,))
+                row = cursor.fetchone()
+                if not row or Decimal(row["balance"]) < amount:
+                    db.rollback()
+                    await message.reply_text("❌ موجودی کافی نیست.", reply_markup=main_keyboard()); return
+                    
+                cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) - %s WHERE user_id = %s", (str(amount), user.id))
+                cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'withdraw', %s, %s)", (user.id, str(-amount), f"Withdraw {wallet[:10]}..."))
                 cursor.execute("INSERT INTO withdrawals(user_id, amount, wallet) VALUES (%s, %s, %s) RETURNING id", (user.id, str(amount), wallet))
-                wid = cursor.fetchone()[0]; db.commit()
-    except Exception:
-        logger.exception("Withdraw insert failed")
-        try: change_balance(user.id, amount, "withdraw_rollback", "Insert failed")
-        except: logger.exception("Withdraw rollback failed")
-        await message.reply_text("❌ برداشت ثبت نشد.", reply_markup=main_keyboard()); return
+                wid = cursor.fetchone()[0]; 
+                db.commit()
+        except Exception:
+            db.rollback(); logger.exception("Withdraw failed"); await message.reply_text("❌ خطا در ثبت برداشت.", reply_markup=main_keyboard()); return
+            
     short_wallet = wallet if len(wallet) <= 40 else wallet[:20] + "..." + wallet[-15:]
     for owner in OWNER_IDS:
         try:
