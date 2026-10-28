@@ -37,6 +37,7 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
+# ✅ لینک دیتابیس اروپا (ایرلند) با پورت 6543
 DATABASE_URL = "postgresql://postgres.uuijbdccragxaumbblhw:Mmad1365277356@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
 
 CURRENCY = "TRX"
@@ -84,7 +85,6 @@ def get_db():
 def init_db():
     with get_db() as db:
         with db.cursor() as cursor:
-            # ساخت جداول اولیه
             cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '', balance TEXT NOT NULL DEFAULT '0', referrer_id BIGINT DEFAULT NULL, captcha_verified INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
             cursor.execute("CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, type TEXT NOT NULL, amount TEXT NOT NULL, description TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
             cursor.execute("CREATE TABLE IF NOT EXISTS referrals (id SERIAL PRIMARY KEY, referrer_id BIGINT NOT NULL, referred_id BIGINT NOT NULL UNIQUE, reward TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -93,7 +93,6 @@ def init_db():
             cursor.execute("CREATE TABLE IF NOT EXISTS withdrawals (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, amount TEXT NOT NULL, wallet TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, processed_at TIMESTAMP DEFAULT NULL, processed_by BIGINT DEFAULT NULL)")
             cursor.execute("CREATE TABLE IF NOT EXISTS banned_users (user_id BIGINT PRIMARY KEY, reason TEXT DEFAULT '', banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, banned_by BIGINT DEFAULT NULL)")
             
-            # اضافه کردن ستون‌های جدید به جدول بازی در صورت وجود نداشتن (مخصوص آپدیت دیتابیس قدیمی)
             cursor.execute("""
                 DO $$ 
                 BEGIN 
@@ -1097,7 +1096,7 @@ def generate_result_text(game_type, mode, creator_id, creator_rolls_list, creato
     
     text = (
         f"━━━━━━━━━━ {emoji} ━━━━━━━━━━\n"
-        f"        🏆 BET_do\n"
+        f"        🏆 BET_TEK\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤  {safe_name(creator_name)}\n"
         f"{emoji}  {c_rolls_fmt}    ➜  {creator_total}\n\n"
@@ -1107,7 +1106,6 @@ def generate_result_text(game_type, mode, creator_id, creator_rolls_list, creato
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆  WINNER\n"
         f"👤  {safe_name(winner_name)}\n\n"
-        f"💸  {opponent_name if winner_id == creator_id else safe_name(creator_name)}\n"
         f"✨  {money(winner_payout)} TRX\n"
         f"━━━━━━━━━━ {emoji} ━━━━━━━━━━"
     )
