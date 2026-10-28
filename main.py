@@ -37,7 +37,6 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
-# ✅ لینک دیتابیس اروپا (ایرلند) با پورت 6543
 DATABASE_URL = "postgresql://postgres.uuijbdccragxaumbblhw:Mmad1365277356@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
 
 CURRENCY = "TRX"
@@ -85,6 +84,7 @@ def get_db():
 def init_db():
     with get_db() as db:
         with db.cursor() as cursor:
+            # ساخت جداول اولیه
             cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '', balance TEXT NOT NULL DEFAULT '0', referrer_id BIGINT DEFAULT NULL, captcha_verified INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
             cursor.execute("CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, type TEXT NOT NULL, amount TEXT NOT NULL, description TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
             cursor.execute("CREATE TABLE IF NOT EXISTS referrals (id SERIAL PRIMARY KEY, referrer_id BIGINT NOT NULL, referred_id BIGINT NOT NULL UNIQUE, reward TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -92,6 +92,19 @@ def init_db():
             cursor.execute("CREATE TABLE IF NOT EXISTS games (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, creator_id BIGINT NOT NULL, opponent_id BIGINT, game_type TEXT NOT NULL, count INTEGER NOT NULL, bet TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'waiting', creator_total INTEGER DEFAULT 0, opponent_total INTEGER DEFAULT 0, creator_rolls INTEGER DEFAULT 0, opponent_rolls INTEGER DEFAULT 0, creator_rolls_list TEXT DEFAULT '', opponent_rolls_list TEXT DEFAULT '', message_id BIGINT DEFAULT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, finished_at TIMESTAMP DEFAULT NULL)")
             cursor.execute("CREATE TABLE IF NOT EXISTS withdrawals (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, amount TEXT NOT NULL, wallet TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, processed_at TIMESTAMP DEFAULT NULL, processed_by BIGINT DEFAULT NULL)")
             cursor.execute("CREATE TABLE IF NOT EXISTS banned_users (user_id BIGINT PRIMARY KEY, reason TEXT DEFAULT '', banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, banned_by BIGINT DEFAULT NULL)")
+            
+            # اضافه کردن ستون‌های جدید به جدول بازی در صورت وجود نداشتن (مخصوص آپدیت دیتابیس قدیمی)
+            cursor.execute("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='games' AND column_name='creator_rolls_list') THEN
+                        ALTER TABLE games ADD COLUMN creator_rolls_list TEXT DEFAULT '';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='games' AND column_name='opponent_rolls_list') THEN
+                        ALTER TABLE games ADD COLUMN opponent_rolls_list TEXT DEFAULT '';
+                    END IF;
+                END $$;
+            """)
             
             cursor.execute("INSERT INTO settings(key, value) VALUES ('bot_enabled', '1') ON CONFLICT (key) DO NOTHING")
             cursor.execute("INSERT INTO settings(key, value) VALUES ('referral_reward', %s) ON CONFLICT (key) DO NOTHING", (str(DEFAULT_REFERRAL_REWARD),))
