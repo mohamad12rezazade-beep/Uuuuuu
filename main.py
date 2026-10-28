@@ -296,7 +296,7 @@ def set_bot_enabled(enabled):
             db.commit()
 
 # ============================================================
-# PRICE FETCHING (Stable Toman)
+# PRICE FETCHING
 # ============================================================
 async def fetch_prices():
     global PRICE_CACHE
@@ -609,10 +609,14 @@ async def show_referral(update, context, target=None):
             cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user.id,))
             total = cursor.fetchone()[0]
     text = f"👥 زیرمجموعه\n\n🔗 لینک دعوت:\n{link}\n\n👤 تعداد: {total}\n🎁 پاداش هر نفر: {money(get_referral_reward())} {CURRENCY}"
-    if target: await safe_send_message(context.bot, target, text)
+    if target: 
+        await safe_send_message(context.bot, target, text)
     elif update.callback_query:
-        try: await update.callback_query.edit_message_text(text)
-        except: pass    else:
+        try: 
+            await update.callback_query.edit_message_text(text)
+        except: 
+            pass
+    else:
         kwargs = {"reply_to_message_id": update.message.message_id}
         if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
         await update.message.reply_text(text, **kwargs)
@@ -726,8 +730,281 @@ async def handle_withdraw_wallet(update, context, wallet):
         except: pass
     await message.reply_text(f"✅ درخواست برداشت ثبت شد.\n\n🆔 شماره: {wid}\n💰 مبلغ: {money(amount)} {CURRENCY}\n📮 ولت: <code>{safe_name(short_wallet)}</code>\n\n⏳ در انتظار تأیید مدیریت.", parse_mode="HTML", reply_markup=main_keyboard())
 
-# ... (بقیه توابع ادمین و بازی‌ها دقیقاً مثل قبل هستند)
-# برای صرفه‌جویی در فضا، بقیه کد رو از پیام قبلی کپی کن، فقط تابع parse_game و نمایش‌های بازی رو تغییر بده.
+async def admin_panel(update, context):
+    user = update.effective_user
+    if not is_owner(user.id): await update.message.reply_text("❌ شما مالک ربات نیستید."); return
+    status = "🟢 روشن" if bot_enabled() else "🔴 خاموش"
+    await update.message.reply_text(f"👑 <b>پنل مدیریت BET_BT</b>\n\nوضعیت ربات: {status}\n🎁 پاداش زیرمجموعه: {money(get_referral_reward())} {CURRENCY}\n💱 واحد پول: {CURRENCY}\n\nاز دکمه‌های پایین صفحه استفاده کنید 👇", parse_mode="HTML", reply_markup=admin_reply_keyboard())
+
+async def ask_admin_balance(update, context, operation):
+    user = update.effective_user
+    context.user_data["admin_operation"] = operation; context.user_data["admin_waiting"] = True
+    title = "➕ شارژ موجودی" if operation == "charge" else "➖ کسر موجودی"
+    kwargs = {"parse_mode": "HTML"}
+    if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+    await update.message.reply_text(f"{title}\n\nفرمت ارسال:\n<code>آیدی_عددی مبلغ</code>\n\nمثال:\n<code>8935601841 100</code>\n\nبرای لغو: <code>لغو</code>", **kwargs)
+
+async def admin_balance_by_id(update, context):
+    user = update.effective_user
+    if not user or not is_owner(user.id): return False
+    operation = context.user_data.get("admin_operation"); waiting = context.user_data.get("admin_waiting")
+    if not operation or not waiting: return False
+    text = normalize_digits(update.message.text.strip())
+    if text == "لغو":
+        context.user_data.pop("admin_operation", None); context.user_data.pop("admin_waiting", None)
+        kwargs = {"reply_markup": admin_reply_keyboard()}
+        if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+        await update.message.reply_text("❌ عملیات لغو شد.", **kwargs); return True
+    match = re.match(r"^(\d+)\s+([0-9]+(?:\.[0-9]+)?)$", text)
+    if not match:
+        await update.message.reply_text("❌ فرمت اشتباه.\n\nمثال:\n<code>8935601841 100</code>\n\nبرای لغو: <code>لغو</code>", parse_mode="HTML"); return True
+    target_id = int(match.group(1)); amount = parse_amount(match.group(2))
+    if amount is None: await update.message.reply_text("❌ مبلغ صحیح نیست."); return True
+    if target_id <= 0: await update.message.reply_text("❌ آیدی کاربر صحیح نیست."); return True
+    ensure_user_id(target_id)
+    context.user_data.pop("admin_operation", None); context.user_data.pop("admin_waiting", None)
+    try:
+        if operation == "charge": new_balance = change_balance(target_id, amount, "admin_charge", f"Owner {user.id}"); title = "شارژ"
+        else: new_balance = change_balance(target_id, -amount, "admin_remove", f"Owner {user.id}"); title = "کسر"
+    except ValueError:
+        kwargs = {"reply_markup": admin_reply_keyboard()}
+        if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+        await update.message.reply_text("❌ موجودی کاربر برای کسر کافی نیست.", **kwargs); return True
+    except Exception:
+        logger.exception("Admin balance by ID failed"); await update.message.reply_text("❌ خطا در تغییر موجودی."); return True
+    kwargs = {"reply_markup": admin_reply_keyboard()}
+    if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+    await update.message.reply_text(f"✅ {title} انجام شد.\n\n🆔 آیدی: {target_id}\n💰 مبلغ: {money(amount)} {CURRENCY}\n💳 موجودی جدید: {money(new_balance)} {CURRENCY}", **kwargs); return True
+
+async def admin_change_by_reply(update, context, operation, amount):
+    user, message = update.effective_user, update.message
+    if not is_owner(user.id): return
+    if not message.reply_to_message: await message.reply_text("❌ باید روی پیام کاربر Reply کنید.", reply_markup=admin_reply_keyboard()); return
+    target = message.reply_to_message.from_user
+    if not target or target.is_bot: await message.reply_text("❌ نامعتبر."); return
+    ensure_user(target)
+    try:
+        if operation == "charge": new_balance = change_balance(target.id, amount, "admin_charge", f"Owner {user.id}"); title = "شارژ"
+        else: new_balance = change_balance(target.id, -amount, "admin_remove", f"Owner {user.id}"); title = "کسر"
+    except ValueError:
+        await message.reply_text("❌ موجودی کاربر برای کسر کافی نیست."); return
+    except Exception:
+        logger.exception("Admin reply balance failed"); await message.reply_text("❌ عملیات انجام نشد."); return
+    kwargs = {}
+    if message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+    await message.reply_text(f"✅ {title} انجام شد.\n\n👤 کاربر: {safe_name(target.first_name or target.id)}\n🆔 آیدی: {target.id}\n💰 مبلغ: {money(amount)} {CURRENCY}\n💳 موجودی جدید: {money(new_balance)} {CURRENCY}", **kwargs)
+    try: await safe_send_message(context.bot, target.id, f"💳 <b>موجودی شما تغییر کرد</b>\n\n{'➕' if operation == 'charge' else '➖'} مبلغ: <b>{money(amount)} {CURRENCY}</b>\n💰 موجودی جدید: <b>{money(new_balance)} {CURRENCY}</b>", parse_mode="HTML", reply_markup=main_keyboard())
+    except: pass
+
+async def send_admin_stats(update, context):
+    user = update.effective_user
+    if not is_owner(user.id): return
+    with get_db() as db:
+        with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("SELECT COUNT(*) AS c FROM users"); users = cursor.fetchone()["c"]
+            cursor.execute("SELECT COALESCE(SUM(CAST(balance AS NUMERIC)), 0) AS total FROM users"); total = float(cursor.fetchone()["total"] or 0)
+            cursor.execute("SELECT COUNT(*) AS c FROM referrals"); referrals = cursor.fetchone()["c"]
+            cursor.execute("SELECT COUNT(*) AS c FROM games"); games = cursor.fetchone()["c"]
+            cursor.execute("SELECT COUNT(*) AS c FROM withdrawals WHERE status = 'pending'"); pending_wd = cursor.fetchone()["c"]
+            cursor.execute("SELECT COUNT(*) AS c FROM users WHERE captcha_verified = 1"); verified = cursor.fetchone()["c"]
+            cursor.execute("SELECT COUNT(*) AS c FROM banned_users"); banned_count = cursor.fetchone()["c"]
+    await update.message.reply_text(f"📊 <b>آمار BET_BT</b>\n\n👤 کاربران: {users}\n✅ تأیید‌شده (کپچا): {verified}\n🚫 بن‌شده‌ها: {banned_count}\n💰 مجموع موجودی: {total:.4f} {CURRENCY}\n👥 زیرمجموعه‌ها: {referrals}\n🎁 پاداش زیرمجموعه: {money(get_referral_reward())} {CURRENCY}\n🎮 بازی‌ها: {games}\n🏧 برداشت در انتظار: {pending_wd}\n\nوضعیت: {'🟢 روشن' if bot_enabled() else '🔴 خاموش'}", parse_mode="HTML", reply_markup=admin_reply_keyboard())
+
+async def send_admin_withdrawals(update, context):
+    user = update.effective_user
+    if not is_owner(user.id): return
+    with get_db() as db:
+        with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY id ASC LIMIT 10")
+            rows = cursor.fetchall()
+    if not rows:
+        await update.message.reply_text("🏧 برداشت‌های در انتظار\n\n✅ هیچ درخواست در انتظاری نیست.", reply_markup=admin_reply_keyboard()); return
+    for wd in rows:
+        await safe_send_message(context.bot, update.effective_chat.id, f"🏧 درخواست #{wd['id']}\n👤 کاربر: <code>{wd['user_id']}</code>\n💰 مبلغ: {money(Decimal(wd['amount']))} {CURRENCY}\n📮 ولت: <code>{safe_name(wd['wallet'])}</code>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید", callback_data=f"wd_ok_{wd['id']}"), InlineKeyboardButton("❌ رد", callback_data=f"wd_no_{wd['id']}")]]))
+    await update.message.reply_text(f"🏧 {len(rows)} درخواست در انتظار — به بالا اسکرول کنید.", reply_markup=admin_reply_keyboard())
+
+async def send_admin_balances(update, context):
+    user = update.effective_user
+    if not is_owner(user.id): return
+    with get_db() as db:
+        with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("SELECT user_id, username, first_name, balance FROM users ORDER BY CAST(balance AS NUMERIC) DESC, user_id ASC")
+            rows = cursor.fetchall()
+    if not rows: await update.message.reply_text("💰 موجودی کاربران\n\n❌ هنوز کاربری ثبت نشده.", reply_markup=admin_reply_keyboard()); return
+    lines = [f"💰 <b>موجودی کاربران ({len(rows)})</b>\n"]
+    for i, r in enumerate(rows, 1):
+        name = f"@{r['username']}" if r["username"] else (r["first_name"] or str(r["user_id"]))
+        lines.append(f"{i}_ {safe_name(name)} <b>{money(Decimal(r['balance']))}</b>")
+    text = "\n".join(lines)
+    if len(text) <= 3800: await update.message.reply_text(text, parse_mode="HTML", reply_markup=admin_reply_keyboard()); return
+    chunk = ""
+    chunks = []
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500: chunks.append(chunk); chunk = line + "\n"
+        else: chunk += line + "\n"
+    if chunk: chunks.append(chunk)
+    for i, ch in enumerate(chunks): await safe_send_message(context.bot, update.effective_chat.id, ch, parse_mode="HTML", reply_markup=admin_reply_keyboard() if i == len(chunks) - 1 else None)
+
+async def ban_command(update, context):
+    user, message = update.effective_user, update.message
+    if not is_owner(user.id): await message.reply_text("❌ دسترسی ندارید."); return
+    target_id = message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else None
+    if not target_id and context.args:
+        try: target_id = int(normalize_digits(context.args[0]))
+        except: pass
+    if not target_id: await message.reply_text("❌ استفاده:\n<code>/ban 123456789</code>\nیا روی پیام کاربر ریپلای کنید.", parse_mode="HTML"); return
+    if target_id == user.id: await message.reply_text("❌ نمی‌توانید خودتان را بن کنید."); return
+    if is_banned(target_id): await message.reply_text("ℹ️ این کاربر قبلاً بن شده است."); return
+    old_balance = ban_user(target_id, reason="owner_ban", banned_by=user.id, zero_balance=True)
+    if old_balance is None: await message.reply_text("❌ خطا در بن."); return
+    await message.reply_text(f"🚫 <b>کاربر از ربات بن شد!</b>\n\n👤 {safe_name(get_user_display_name(target_id))}\n🆔 <code>{target_id}</code>\n💰 موجودی صفر شد: <b>{money(old_balance)} {CURRENCY}</b>\n\n✅ از ربات بن شد و موجودی صفر شد.", parse_mode="HTML")
+    try: await safe_send_message(context.bot, target_id, f"🚫 <b>شما از ربات بن شدید!</b>\n\n💰 موجودی شما ({money(old_balance)} {CURRENCY}) صفر شد.\nدسترسی شما به ربات مسدود است.", parse_mode="HTML")
+    except: pass
+
+async def unban_command(update, context):
+    user, message = update.effective_user, update.message
+    if not is_owner(user.id): await message.reply_text("❌ دسترسی ندارید."); return
+    target_id = message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else None
+    if not target_id and context.args:
+        try: target_id = int(normalize_digits(context.args[0]))
+        except: pass
+    if not target_id: await message.reply_text("❌ استفاده:\n<code>/unban 123456789</code>\nیا روی پیام کاربر ریپلای کنید.", parse_mode="HTML"); return
+    if not is_banned(target_id): await message.reply_text("ℹ️ این کاربر بن نیست."); return
+    unban_user(target_id)
+    await message.reply_text(f"✅ کاربر <code>{target_id}</code> از بن خارج شد.\n\n⚠️ توجه: اگر هنوز اسم نداشته باشد، دوباره بن می‌شود.", parse_mode="HTML")
+    try: await safe_send_message(context.bot, target_id, "✅ <b>شما از بن خارج شدید!</b>\n\nحالا می‌توانید از ربات استفاده کنید.\n⚠️ اگر اسم نداشته باشید، دوباره بن می‌شوید.", parse_mode="HTML", reply_markup=main_keyboard())
+    except: pass
+
+async def banned_list_command(update, context):
+    user = update.effective_user
+    if not is_owner(user.id): return
+    with get_db() as db:
+        with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("SELECT b.user_id, b.reason, b.banned_at, u.first_name, u.username FROM banned_users b LEFT JOIN users u ON u.user_id = b.user_id ORDER BY b.banned_at DESC LIMIT 50")
+            rows = cursor.fetchall()
+    if not rows: await update.message.reply_text("🚫 هیچ کاربری بن نیست."); return
+    lines = [f"🚫 <b>لیست بن‌شده‌ها ({len(rows)})</b>\n"]
+    for r in rows: lines.append(f"• <code>{r['user_id']}</code> — {safe_name(r['first_name'] or r['username'] or '-')} ({safe_name(r['reason'] or '-')})")
+    text = "\n".join(lines)
+    if len(text) <= 3800: await update.message.reply_text(text, parse_mode="HTML"); return
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500: await safe_send_message(context.bot, update.effective_chat.id, chunk, parse_mode="HTML"); chunk = line + "\n"
+        else: chunk += line + "\n"
+    if chunk: await safe_send_message(context.bot, update.effective_chat.id, chunk, parse_mode="HTML")
+
+async def withdraw_callback(update, context):
+    query, user = update.callback_query, update.callback_query.from_user
+    if not is_owner(user.id):
+        try: await query.answer("❌ دسترسی ندارید.", show_alert=True)
+        except: pass
+        return
+    try: _, action, wd_id = query.data.split("_"); wd_id = int(wd_id)
+    except: return
+    with get_db() as db:
+        try:
+            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("SELECT * FROM withdrawals WHERE id = %s FOR UPDATE", (wd_id,))
+                wd = cursor.fetchone()
+                if not wd or wd["status"] != "pending":
+                    db.rollback(); await query.answer("❌ درخواست در دسترس نیست.", show_alert=True); return
+                amount, wd_uid, wd_wallet = Decimal(wd["amount"]), int(wd["user_id"]), wd["wallet"]
+                if action == "ok":
+                    cursor.execute("UPDATE withdrawals SET status = 'approved', processed_at = CURRENT_TIMESTAMP, processed_by = %s WHERE id = %s", (user.id, wd_id))
+                    db.commit()
+                    try: await query.answer("✅ تأیید شد."); await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📤 ارسال مدرک پرداخت", callback_data=f"wd_proof_{wd_id}")]]))
+                    except: pass
+                    await safe_send_message(context.bot, wd_uid, f"✅ <b>درخواست برداشت شما تأیید شد.</b>\n\n🆔 شماره: {wd_id}\n💰 مبلغ: {money(amount)} {CURRENCY}\n📮 ولت: <code>{safe_name(wd_wallet)}</code>\n\n⏳ مبلغ ارسال خواهد شد.", parse_mode="HTML")
+                else:
+                    cursor.execute("UPDATE withdrawals SET status = 'rejected', processed_at = CURRENT_TIMESTAMP, processed_by = %s WHERE id = %s", (user.id, wd_id))
+                    cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) + %s WHERE user_id = %s", (str(amount), wd_uid))
+                    cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'withdraw_rejected_refund', %s, %s)", (wd_uid, str(amount), f"Withdraw rejected {wd_id}"))
+                    db.commit()
+                    try: await query.answer("❌ رد شد."); await query.edit_message_reply_markup(reply_markup=None)
+                    except: pass
+                    await safe_send_message(context.bot, wd_uid, f"❌ <b>درخواست برداشت شما رد شد.</b>\n\n🆔 شماره: {wd_id}\n💰 مبلغ: {money(amount)} {CURRENCY}\n💳 مبلغ به موجودی شما برگشت داده شد.", parse_mode="HTML")
+        except Exception:
+            db.rollback(); logger.exception("Withdraw callback failed")
+
+async def wd_proof_callback(update, context):
+    query, user = update.callback_query, update.callback_query.from_user
+    if not is_owner(user.id):
+        try: await query.answer("❌ دسترسی ندارید.", show_alert=True)
+        except: pass
+        return
+    try: wd_id = int(query.data.replace("wd_proof_", ""))
+    except: return
+    with get_db() as db:
+        with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("SELECT * FROM withdrawals WHERE id = %s", (wd_id,))
+            wd = cursor.fetchone()
+    if not wd or wd["status"] != "approved":
+        try: await query.answer("❌ درخواست تأیید نشده.", show_alert=True)
+        except: pass
+        return
+    target_id = int(wd["user_id"]); PENDING_PROOF[user.id] = target_id
+    try: await query.answer("✅ در انتظار مدرک از شما")
+    except: pass
+    await safe_send_message(context.bot, query.message.chat_id, f"📤 <b>ارسال مدرک پرداخت</b>\n\n👤 گیرنده: <code>{target_id}</code>\n💰 مبلغ: {money(Decimal(wd['amount']))} {CURRENCY}\n\nحالا هر پیام (متن، عکس، ویس، ویدیو، سند) که بفرستی،\nمستقیم برای کاربر فوروارد می‌شود.\n\nبرای لغو: <code>لغو مدرک</code>", parse_mode="HTML")
+
+async def owner_proof_handler(update, context):
+    user, message = update.effective_user, update.message
+    if not user or not message or not is_owner(user.id) or user.id not in PENDING_PROOF or message.chat.type != ChatType.PRIVATE: return
+    if message.text and message.text.strip() == "لغو مدرک":
+        target = PENDING_PROOF.pop(user.id, None); await message.reply_text(f"❌ ارسال مدرک لغو شد.\n(گیرنده: {target})"); return
+    target_id = PENDING_PROOF[user.id]
+    try:
+        await message.copy(chat_id=target_id); await message.reply_text(f"✅ مدرک برای کاربر <code>{target_id}</code> ارسال شد.\n\nبرای لغو: <code>لغو مدرک</code>", parse_mode="HTML")
+    except:
+        logger.exception("Proof forward failed"); await message.reply_text("❌ ارسال ناموفق بود."); PENDING_PROOF.pop(user.id, None)
+
+GAME_INFO = {"dice": ("🎲", "تاس"), "darts": ("🎯", "دارت"), "bowling": ("🎳", "بولینگ"), "basketball": ("🏀", "بسکتبال")}
+GAME_NAMES = {"تاس": "dice", "دارت": "darts", "دارتس": "darts", "بولینگ": "bowling", "بولينگ": "bowling", "بسکتبال": "basketball", "dice": "dice", "darts": "darts", "bowling": "bowling", "basketball": "basketball"}
+GAME_EMOJI = {"dice": "🎲", "darts": "🎯", "bowling": "🎳", "basketball": "🏀"}
+
+def parse_game(text):
+    text = normalize_digits(text.strip())
+    
+    match_new = re.match(r"^([^\s]+)\s+(\d+)$", text)
+    if match_new:
+        name = match_new.group(1).lower()
+        count = int(match_new.group(2))
+        if name in GAME_NAMES:
+            if count < 1: return None
+            if MAX_GAME_COUNT is not None and count > MAX_GAME_COUNT: return "count_too_high"
+            return (count, GAME_NAMES[name], MIN_GAME_BET)
+
+    match_old = re.match(r"^(\d+)\s+([^\s]+)\s+([0-9]+(?:\.[0-9]+)?)$", text)
+    if match_old:
+        count = int(match_old.group(1))
+        name = match_old.group(2).lower()
+        bet = parse_amount(match_old.group(3))
+        if count < 1: return None
+        if MAX_GAME_COUNT is not None and count > MAX_GAME_COUNT: return "count_too_high"
+        if bet is None or name not in GAME_NAMES: return None
+        return (count, GAME_NAMES[name], bet)
+
+    return None
+
+def get_active_game_for_user(chat_id, user_id):
+    with get_db() as db:
+        with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("SELECT * FROM games WHERE chat_id = %s AND status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND (creator_id = %s OR opponent_id = %s) ORDER BY id DESC LIMIT 1", (chat_id, user_id, user_id))
+            return cursor.fetchone()
+
+def get_game(game_id):
+    with get_db() as db:
+        with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("SELECT * FROM games WHERE id = %s", (game_id,))
+            return cursor.fetchone()
+
+def dice_to_points(game_type, dice_value):
+    if game_type == "basketball": return 1 if int(dice_value) >= 4 else 0
+    return int(dice_value)
+
+def format_score(game_type, score):
+    if game_type == "basketball": return f"{score} گل"
+    return str(score)
 
 async def create_game(update, context, count, game_type, bet):
     user, chat = update.effective_user, update.effective_chat
@@ -756,66 +1033,6 @@ async def create_game(update, context, count, game_type, bet):
             await update.message.reply_text("❌ ساخت بازی انجام نشد."); return
     emoji, name = GAME_INFO[game_type]
     sent = await update.message.reply_text(f"🎮 بازی جدید\n\n{emoji} {name}\n🔢 تعداد: {count}\n💰 شرط: {money(bet)} {CURRENCY}\n👤 سازنده: {safe_name(user.first_name or user.id)}\n\nیکی از گزینه‌ها را انتخاب کنید.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 بازی با دوستان", callback_data=f"join_{game_id}")], [InlineKeyboardButton("🤖 بازی با ربات", callback_data=f"bot_{game_id}")], [InlineKeyboardButton("❌ لغو بازی", callback_data=f"cancel_{game_id}")]]))
-    if sent:
-        with get_db() as db:
-            with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
-
-async def join_game_callback(update, context):
-    query, user = update.callback_query, update.callback_query.from_user
-    if not await require_captcha_and_membership(update, context): return
-    try: game_id = int(query.data.replace("join_", ""))
-    except: return
-    ensure_user(user)
-    with get_db() as db:
-        try:
-            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
-                game = cursor.fetchone()
-                if not game or game["status"] != "waiting" or game["creator_id"] == user.id:
-                    db.rollback(); await query.answer("❌ نامعتبر.", show_alert=True); return
-                cursor.execute("SELECT id FROM games WHERE chat_id = %s AND status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND (creator_id = %s OR opponent_id = %s) LIMIT 1", (game["chat_id"], user.id, user.id))
-                if cursor.fetchone():
-                    db.rollback(); await query.answer("⏳ در یک بازی دیگر مشغول هستید!", show_alert=True); return
-                
-                bet = Decimal(game["bet"])
-                cursor.execute("SELECT balance FROM users WHERE user_id = %s FOR UPDATE", (user.id,))
-                row = cursor.fetchone()
-                if not row or Decimal(row["balance"]) < bet:
-                    db.rollback(); await query.answer("❌ موجودی کافی نیست.", show_alert=True); return
-                
-                cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) - %s WHERE user_id = %s", (str(bet), user.id))
-                cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'game_bet', %s, %s)", (user.id, str(-bet), f"Join game {game_id}"))
-                cursor.execute("UPDATE games SET opponent_id = %s, mode = 'friends', status = 'creator_turn', creator_rolls = 0, opponent_rolls = 0, creator_total = 0, opponent_total = 0, creator_rolls_list = '', opponent_rolls_list = '' WHERE id = %s", (user.id, game_id))
-                db.commit()
-        except Exception:
-            db.rollback(); await query.answer("❌ خطا.", show_alert=True); return
-    await safe_delete_message(context.bot, query.message.chat_id, query.message.message_id)
-    emoji, name = GAME_INFO[game["game_type"]]
-    text = generate_start_text(game["game_type"], "friends", game["creator_id"], user.id, game["count"])
-    sent = await safe_send_message(context.bot, query.message.chat_id, text, parse_mode="HTML")
-    if sent:
-        with get_db() as db:
-            with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
-
-async def bot_game_callback(update, context):
-    query, user = update.callback_query, update.callback_query.from_user
-    if not await require_captcha_and_membership(update, context): return
-    try: game_id = int(query.data.replace("bot_", ""))
-    except: return
-    with get_db() as db:
-        try:
-            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
-                game = cursor.fetchone()
-                if not game or game["status"] != "waiting" or game["creator_id"] != user.id:
-                    db.rollback(); await query.answer("❌ بازی فعال نیست.", show_alert=True); return
-                cursor.execute("UPDATE games SET opponent_id = -1, mode = 'bot', status = 'creator_turn', creator_rolls = 0, opponent_rolls = 0, creator_total = 0, opponent_total = 0, creator_rolls_list = '', opponent_rolls_list = '' WHERE id = %s", (game_id,))
-                db.commit()
-        except:
-            db.rollback(); return
-    await safe_delete_message(context.bot, query.message.chat_id, query.message.message_id)
-    text = generate_start_text(game["game_type"], "bot", user.id, -1, game["count"])
-    sent = await safe_send_message(context.bot, query.message.chat_id, text, parse_mode="HTML")
     if sent:
         with get_db() as db:
             with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
@@ -883,9 +1100,90 @@ def generate_result_text(game_type, mode, creator_id, creator_rolls_list, creato
     )
     return text
 
-# ============================================================
-# GAME LOGIC (Updated to save lists & generate fancy text)
-# ============================================================
+async def join_game_callback(update, context):
+    query, user = update.callback_query, update.callback_query.from_user
+    if not await require_captcha_and_membership(update, context): return
+    try: game_id = int(query.data.replace("join_", ""))
+    except: return
+    ensure_user(user)
+    with get_db() as db:
+        try:
+            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
+                game = cursor.fetchone()
+                if not game or game["status"] != "waiting" or game["creator_id"] == user.id:
+                    db.rollback(); await query.answer("❌ نامعتبر.", show_alert=True); return
+                cursor.execute("SELECT id FROM games WHERE chat_id = %s AND status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND (creator_id = %s OR opponent_id = %s) LIMIT 1", (game["chat_id"], user.id, user.id))
+                if cursor.fetchone():
+                    db.rollback(); await query.answer("⏳ در یک بازی دیگر مشغول هستید!", show_alert=True); return
+                
+                bet = Decimal(game["bet"])
+                cursor.execute("SELECT balance FROM users WHERE user_id = %s FOR UPDATE", (user.id,))
+                row = cursor.fetchone()
+                if not row or Decimal(row["balance"]) < bet:
+                    db.rollback(); await query.answer("❌ موجودی کافی نیست.", show_alert=True); return
+                
+                cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) - %s WHERE user_id = %s", (str(bet), user.id))
+                cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'game_bet', %s, %s)", (user.id, str(-bet), f"Join game {game_id}"))
+                cursor.execute("UPDATE games SET opponent_id = %s, mode = 'friends', status = 'creator_turn', creator_rolls = 0, opponent_rolls = 0, creator_total = 0, opponent_total = 0, creator_rolls_list = '', opponent_rolls_list = '' WHERE id = %s", (user.id, game_id))
+                db.commit()
+        except Exception:
+            db.rollback(); await query.answer("❌ خطا.", show_alert=True); return
+    await safe_delete_message(context.bot, query.message.chat_id, query.message.message_id)
+    text = generate_start_text(game["game_type"], "friends", game["creator_id"], user.id, game["count"])
+    sent = await safe_send_message(context.bot, query.message.chat_id, text, parse_mode="HTML")
+    if sent:
+        with get_db() as db:
+            with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
+
+async def bot_game_callback(update, context):
+    query, user = update.callback_query, update.callback_query.from_user
+    if not await require_captcha_and_membership(update, context): return
+    try: game_id = int(query.data.replace("bot_", ""))
+    except: return
+    with get_db() as db:
+        try:
+            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
+                game = cursor.fetchone()
+                if not game or game["status"] != "waiting" or game["creator_id"] != user.id:
+                    db.rollback(); await query.answer("❌ بازی فعال نیست.", show_alert=True); return
+                cursor.execute("UPDATE games SET opponent_id = -1, mode = 'bot', status = 'creator_turn', creator_rolls = 0, opponent_rolls = 0, creator_total = 0, opponent_total = 0, creator_rolls_list = '', opponent_rolls_list = '' WHERE id = %s", (game_id,))
+                db.commit()
+        except:
+            db.rollback(); return
+    await safe_delete_message(context.bot, query.message.chat_id, query.message.message_id)
+    text = generate_start_text(game["game_type"], "bot", user.id, -1, game["count"])
+    sent = await safe_send_message(context.bot, query.message.chat_id, text, parse_mode="HTML")
+    if sent:
+        with get_db() as db:
+            with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
+
+async def cancel_game_callback(update, context):
+    query, user = update.callback_query, update.callback_query.from_user
+    try: game_id = int(query.data.replace("cancel_", ""))
+    except: return
+    with get_db() as db:
+        try:
+            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
+                game = cursor.fetchone()
+                if not game or game["status"] != "waiting" or (game["creator_id"] != user.id and not is_owner(user.id)):
+                    db.rollback(); await query.answer("❌ بازی قابل لغو نیست.", show_alert=True); return
+                bet = Decimal(game["bet"])
+                cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) + %s WHERE user_id = %s", (str(bet), game["creator_id"]))
+                cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'game_refund', %s, %s)", (game["creator_id"], str(bet), f"Cancel game {game_id}"))
+                cursor.execute("UPDATE games SET status = 'cancelled', finished_at = CURRENT_TIMESTAMP WHERE id = %s", (game_id,))
+                db.commit()
+        except:
+            db.rollback(); await query.answer("❌ لغو انجام نشد.", show_alert=True); return
+    try: await query.answer("بازی لغو شد.")
+    except: pass
+    await safe_delete_message(context.bot, query.message.chat_id, query.message.message_id)
+    await safe_send_message(context.bot, query.message.chat_id, f"❌ بازی لغو شد.\n\n💰 {money(bet)} {CURRENCY} به سازنده برگشت داده شد.")
+
+def dice_matches_game(dice_emoji, game_type): return dice_emoji == GAME_EMOJI[game_type]
+
 async def user_game_dice_handler(update, context):
     message, user, chat = update.message, update.effective_user, update.effective_chat
     if not message or not user or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not is_game_chat(chat) or not message.dice or is_banned(user.id): return
@@ -985,7 +1283,7 @@ async def finish_game(context, game_id):
                 if c_total == o_total:
                     credit(c_id, bet, "draw_refund", f"Draw {game_id}")
                     if mode == "friends" and o_id and int(o_id) > 0: credit(int(o_id), bet, "draw_refund", f"Draw {game_id}")
-                    winner_id = 0 # 0 means draw
+                    winner_id = 0
                 else:
                     winner_id = c_id if c_total > o_total else (int(o_id) if o_id and int(o_id) > 0 else -1)
                     credit(winner_id, payout, "game_win", f"Win {game_id}")
@@ -996,9 +1294,153 @@ async def finish_game(context, game_id):
     text = generate_result_text(game["game_type"], mode, c_id, c_list, c_total, o_id, o_list, o_total, winner_id, payout if winner_id != 0 else bet)
     await safe_send_message(context.bot, game["chat_id"], text, parse_mode="HTML")
 
-# ============================================================
-# MAIN
-# ============================================================
+async def reset_game_internal(context, game_id, reason="manual"):
+    with get_db() as db:
+        try:
+            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
+                game = cursor.fetchone()
+                if not game or game["status"] in ("finished", "cancelled", "reset"): db.rollback(); return False
+                bet = Decimal(game["bet"])
+                cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) + %s WHERE user_id = %s", (str(bet), game["creator_id"]))
+                cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'game_reset_refund', %s, %s)", (game["creator_id"], str(bet), f"Reset {game_id}"))
+                if game["mode"] == "friends" and game["opponent_id"] and int(game["opponent_id"]) > 0:
+                    cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) + %s WHERE user_id = %s", (str(bet), game["opponent_id"]))
+                    cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'game_reset_refund', %s, %s)", (game["opponent_id"], str(bet), f"Reset {game_id}"))
+                cursor.execute("UPDATE games SET status = 'reset', finished_at = CURRENT_TIMESTAMP WHERE id = %s", (game_id,))
+                db.commit()
+        except:
+            db.rollback(); return False
+    return True
+
+async def reset_game_command(update, context):
+    user, chat = update.effective_user, update.effective_chat
+    if not is_owner(user.id): await update.message.reply_text("❌ فقط مالک می‌تواند ریست کند."); return
+    if context.args:
+        try: game_id = int(normalize_digits(context.args[0]))
+        except: await update.message.reply_text("❌ آیدی بازی صحیح نیست.\nمثال:\n/resetgame 25"); return
+    else:
+        with get_db() as db:
+            with db.cursor() as cursor:
+                cursor.execute("SELECT id FROM games WHERE chat_id = %s AND status NOT IN ('finished', 'cancelled', 'reset') ORDER BY id DESC LIMIT 1", (chat.id,))
+                row = cursor.fetchone()
+        if not row: await update.message.reply_text("❌ بازی فعالی در این گپ نیست."); return
+        game_id = int(row["id"])
+    if await reset_game_internal(context, game_id, reason=f"Owner {user.id}"): await update.message.reply_text(f"♻️ بازی ریست شد.\n🎮 Game ID: {game_id}")
+    else: await update.message.reply_text("❌ بازی پیدا نشد یا بسته شده.")
+
+async def reset_all_games_command(update, context):
+    user = update.effective_user
+    if not is_owner(user.id): await update.message.reply_text("❌ فقط مالک."); return
+    with get_db() as db:
+        with db.cursor() as cursor:
+            cursor.execute("SELECT id FROM games WHERE status NOT IN ('finished', 'cancelled', 'reset')")
+            rows = cursor.fetchall()
+    count = sum([1 for row in rows if await reset_game_internal(context, int(row["id"]), reason=f"Owner all {user.id}")])
+    await update.message.reply_text(f"♻️ ریست انجام شد.\n🎮 تعداد: {count}")
+
+async def cleanup_old_games(context):
+    with get_db() as db:
+        with db.cursor() as cursor:
+            cursor.execute("SELECT id FROM games WHERE status IN ('waiting', 'creator_turn', 'opponent_turn', 'bot_turn', 'finishing') AND created_at < NOW() - INTERVAL '%s minutes'", (GAME_TIMEOUT_MINUTES,))
+            rows = cursor.fetchall()
+    for row in rows: await reset_game_internal(context, int(row["id"]), reason="timeout")
+
+async def cleanup_job(context):
+    try: await cleanup_old_games(context)
+    except: logger.exception("Cleanup job failed")
+
+async def text_handler(update, context):
+    message, user = update.message, update.effective_user
+    if not message or not user or not message.text: return
+    ensure_user(user)
+    if not await require_captcha_and_membership(update, context): return
+    raw_text = message.text.strip(); text = normalize_digits(raw_text).strip()
+    step = context.user_data.get("withdraw_step")
+    if step == "amount":
+        if text == "لغو" or raw_text == "لغو": context.user_data.pop("withdraw_step", None); context.user_data.pop("withdraw_amount", None); await message.reply_text("❌ برداشت لغو شد.", reply_markup=main_keyboard()); return
+        await handle_withdraw_amount(update, context, text); return
+    if step == "wallet":
+        if text == "لغو" or raw_text == "لغو": context.user_data.pop("withdraw_step", None); context.user_data.pop("withdraw_amount", None); await message.reply_text("❌ برداشت لغو شد.", reply_markup=main_keyboard()); return
+        await handle_withdraw_wallet(update, context, text); return
+    if is_owner(user.id) and await admin_balance_by_id(update, context): return
+    if is_owner(user.id):
+        m = re.match(r"^شارژ\s+([0-9]+(?:\.[0-9]+)?)$", text)
+        if m: await admin_change_by_reply(update, context, "charge", parse_amount(m.group(1)) or Decimal("0")); return
+        m = re.match(r"^کسر\s+([0-9]+(?:\.[0-9]+)?)$", text)
+        if m: await admin_change_by_reply(update, context, "remove", parse_amount(m.group(1)) or Decimal("0")); return
+    if raw_text == "بن" or raw_text.startswith("بن "):
+        if not is_owner(user.id): await message.reply_text("❌ فقط مالک ربات می‌تونه بن کنه."); return
+        target_id = message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else None
+        if not target_id:
+            m = re.match(r"^بن\s+(\d{5,15})$", text)
+            if m: target_id = int(m.group(1))
+        if not target_id: await message.reply_text("❌ روش استفاده:\n1️⃣ ریپلای + <code>بن</code>\n2️⃣ <code>بن 123456789</code>", parse_mode="HTML"); return
+        if target_id == user.id or is_banned(target_id): await message.reply_text("❌ نامعتبر یا قبلا بن شده."); return
+        old_balance = ban_user(target_id, reason="owner_ban", banned_by=user.id, zero_balance=True)
+        if old_balance is None: await message.reply_text("❌ خطا در بن."); return
+        await message.reply_text(f"🚫 <b>کاربر بن شد!</b>\n\n🆔 <code>{target_id}</code>\n💰 موجودی صفر شد: <b>{money(old_balance)} {CURRENCY}</b>", parse_mode="HTML")
+        try: await safe_send_message(context.bot, target_id, "🚫 <b>شما از ربات بن شدید!</b>", parse_mode="HTML")
+        except: pass
+        return
+    if raw_text.startswith("حذف بن"):
+        if not is_owner(user.id): await message.reply_text("❌ فقط مالک."); return
+        target_id = message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else None
+        if not target_id:
+            m = re.match(r"^حذف\s*بن\s+(\d{5,15})$", text)
+            if m: target_id = int(m.group(1))
+        if not target_id or not is_banned(target_id): await message.reply_text("❌ کاربر بن نیست یا آیدی نامعتبر."); return
+        unban_user(target_id)
+        await message.reply_text(f"✅ کاربر <code>{target_id}</code> از بن خارج شد.", parse_mode="HTML")
+        try: await safe_send_message(context.bot, target_id, "✅ <b>شما از بن خارج شدید!</b>", parse_mode="HTML", reply_markup=main_keyboard())
+        except: pass
+        return
+    if is_owner(user.id) and message.chat.type == ChatType.PRIVATE:
+        if raw_text in ("📊 آمار ربات", "📊 آمار"): await send_admin_stats(update, context); return
+        if raw_text == "🟢 روشن": set_bot_enabled(True); await message.reply_text("🟢 ربات روشن شد.", reply_markup=admin_reply_keyboard()); return
+        if raw_text == "🔴 خاموش": set_bot_enabled(False); await message.reply_text("🔴 ربات خاموش شد.", reply_markup=admin_reply_keyboard()); return
+        if raw_text in ("➕ شارژ کاربر", "➕ شارژ"): await ask_admin_balance(update, context, "charge"); return
+        if raw_text in ("➖ کسر کاربر", "➖ کسر"): await ask_admin_balance(update, context, "remove"); return
+        if raw_text == "🏧 برداشت‌های در انتظار": await send_admin_withdrawals(update, context); return
+        if raw_text == "💰 موجودی کاربران": await send_admin_balances(update, context); return
+        if raw_text == "➕ افزایش پاداش": set_referral_reward(get_referral_reward() + Decimal("0.01")); await message.reply_text(f"✅ پاداش افزایش یافت: {money(get_referral_reward())} {CURRENCY}", reply_markup=admin_reply_keyboard()); return
+        if raw_text.startswith("➖ کاهش پاداش"): set_referral_reward(max(get_referral_reward() - Decimal("0.01"), Decimal("0"))); await message.reply_text(f"✅ پاداش کاهش یافت: {money(get_referral_reward())} {CURRENCY}", reply_markup=admin_reply_keyboard()); return
+        if raw_text in ("🏠 منوی اصلی", "منوی اصلی"): await send_start_menu(context, message.chat.id, user.id); return
+    if is_owner(user.id) and message.chat.type != ChatType.PRIVATE:
+        if raw_text in ["📊 آمار ربات", "📊 آمار", "🟢 روشن", "🔴 خاموش", "➕ شارژ کاربر", "➕ شارژ", "➖ کسر کاربر", "➖ کسر", "🏧 برداشت‌های در انتظار", "💰 موجودی کاربران", "🚫 بن کاربر", "✅ آنبن کاربر", "➕ افزایش پاداش", "🏠 منوی اصلی"] or raw_text.startswith("➖ کاهش پاداش"):
+            await message.reply_text("❌ پنل مدیریت فقط در پیوی کار می‌کند.", reply_markup=ReplyKeyboardRemove()); return
+    if raw_text in ("💰 موجودی", "موجودی", "م", "موجودی من", "balance"): await show_balance(update, context); return
+    if raw_text in ("👥 زیرمجموعه", "زیرمجموعه", "زیر مجموعه", "رفرال", "referral"): await show_referral(update, context); return
+    if raw_text in ("🏧 برداشت TRX", "برداشت"): await show_withdraw_info(update, context); return
+    if raw_text in ("🆔 آیدی من", "آیدی", "ایدی", "myid", "id"): await show_my_id(update, context); return
+    if raw_text in ("📚 راهنما", "راهنما", "کمک", "help"): await show_help(update, context); return
+    if text.startswith("انتقال"):
+        match_id = re.match(r"^انتقال\s+([0-9]+(?:\.[0-9]+)?)\s+(\d{5,15})$", text); match_reply = re.match(r"^انتقال\s+([0-9]+(?:\.[0-9]+)?)$", text)
+        if match_id: await transfer_by_id(update, context, parse_amount(match_id.group(1)) or Decimal("0"), int(match_id.group(2))); return
+        if match_reply: await transfer(update, context, parse_amount(match_reply.group(1)) or Decimal("0")); return
+        await message.reply_text("❌ فرمت صحیح:\n1️⃣ <code>انتقال 0.5</code>\n2️⃣ <code>انتقال 0.5 123456789</code>", parse_mode="HTML"); return
+    game = parse_game(text)
+    if game == "count_too_high": await message.reply_text(f"❌ حداکثر تعداد پرتاب {MAX_GAME_COUNT} است.\nمثال:\n3 تاس 0.5"); return
+    if game:
+        if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP): await message.reply_text("❌ بازی‌ها فقط داخل گپ انجام می‌شوند."); return
+        if not is_game_chat(message.chat): await message.reply_text(f"❌ بازی فقط در گپ زیر مجاز است:\n{GROUP_URL}"); return
+        count, game_type, bet = game; await create_game(update, context, count, game_type, bet); return
+
+async def admin_command(update, context):
+    user = update.effective_user
+    if not is_owner(user.id): await update.message.reply_text("❌ دسترسی ندارید."); return
+    if update.message.chat.type != ChatType.PRIVATE: await update.message.reply_text("❌ پنل مدیریت فقط در پیوی در دسترسه."); return
+    await admin_panel(update, context)
+
+async def balance_command(update, context): await show_balance(update, context)
+async def referral_command(update, context): await show_referral(update, context)
+async def help_command(update, context): await show_help(update, context)
+
+async def error_handler(update, context):
+    error = context.error
+    if isinstance(error, (TimedOut, NetworkError)): return
+    logger.exception("Unhandled exception", exc_info=error)
+
 def main():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
     init_db_pool() 
