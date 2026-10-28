@@ -37,7 +37,6 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
-# ✅ لینک دیتابیس اروپا (ایرلند) با پورت 6543
 DATABASE_URL = "postgresql://postgres.uuijbdccragxaumbblhw:Mmad1365277356@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
 
 CURRENCY = "TRX"
@@ -48,9 +47,11 @@ DEFAULT_REFERRAL_REWARD = Decimal("0.05")
 MIN_WITHDRAWAL = Decimal("2")
 WIN_MULTIPLIER = Decimal("1.8")
 GAME_TIMEOUT_MINUTES = 30
+GAME_TIMER_SECONDS = 60
 
 PENDING_PROOF: dict = {}
 PENDING_CAPTCHA: dict = {}
+ACTIVE_TIMERS: dict = {} 
 DOT_CHARS = [".", "۔", "•", "·", "⋅", "٫", "٬", "。", "｡", "…"]
 PRICE_CACHE = {"trx_usd": None, "usdt_toman": None, "last_update": 0}
 
@@ -1091,7 +1092,27 @@ def generate_result_text(game_type, mode, creator_id, creator_rolls_list, creato
     c_rolls_fmt = format_rolls(creator_rolls_list, game_type)
     o_rolls_fmt = format_rolls(opponent_rolls_list, game_type)
     
-    winner_name = get_user_display_name(winner_id) if winner_id else "مساوی"
+    if winner_id == 0:
+        # مساوی شده - دوباره شروع میشه
+        next_tag = user_tag(creator_id)
+        return (
+            f"╔══════════════════════════╗\n"
+            f"║      {emoji}   BET_TEK     ║\n"
+            f"╠══════════════════════════╣\n"
+            f"║                          ║\n"
+            f"║ ⚖️ نتیجه این راند مساوی شد!\n"
+            f"║                          ║\n"
+            f"║ 🔁 راند دوباره آغاز میشه\n"
+            f"║                          ║\n"
+            f"╠══════════════════════════╣\n"
+            f"║ 🔔 نوبت بازیکن\n"
+            f"║ 👤 {next_tag}\n"
+            f"║                          ║\n"
+            f"║ {emoji} دوباره {emoji} بفرست.\n"
+            f"╚══════════════════════════╝"
+        )
+        
+    winner_name = get_user_display_name(winner_id) if winner_id else "?"
     if winner_id == -1: winner_name = "🤖 ربات"
     
     text = (
@@ -1110,6 +1131,79 @@ def generate_result_text(game_type, mode, creator_id, creator_rolls_list, creato
         f"━━━━━━━━━━ {emoji} ━━━━━━━━━━"
     )
     return text
+
+async def game_timer_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    game_id = job.data.get("game_id")
+    game = get_game(game_id)
+    if not game: return
+    if game["status"] not in ("creator_turn", "opponent_turn", "bot_turn"): 
+        ACTIVE_TIMERS.pop(game_id, None)
+        return
+    
+    # تایم تمام شد
+    with get_db() as db:
+        try:
+            with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("SELECT * FROM games WHERE id = %s FOR UPDATE", (game_id,))
+                fresh = cursor.fetchone()
+                if not fresh or fresh["status"] not in ("creator_turn", "opponent_turn", "bot_turn"): return
+                
+                loser_id = fresh["creator_id"] if fresh["status"] == "creator_turn" else (fresh["opponent_id"] if fresh["opponent_id"] and int(fresh["opponent_id"]) > 0 else -1)
+                winner_id = fresh["opponent_id"] if fresh["status"] == "creator_turn" else fresh["creator_id"]
+                bet = Decimal(fresh["bet"])
+                payout = (bet * WIN_MULTIPLIER).quantize(Decimal("0.00000001"))
+                commission = (bet * 2) - payout
+                
+                if winner_id and int(winner_id) > 0:
+                    cursor.execute("INSERT INTO users(user_id, balance) VALUES (%s, '0') ON CONFLICT (user_id) DO NOTHING", (int(winner_id),))
+                    cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) + %s WHERE user_id = %s", (str(payout), int(winner_id)))
+                    cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'game_win_timeout', %s, %s)", (int(winner_id), str(payout), f"Win by timeout {game_id}"))
+                    cursor.execute("INSERT INTO users(user_id, balance) VALUES (%s, '0') ON CONFLICT (user_id) DO NOTHING", (OWNER_ID,))
+                    cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) + %s WHERE user_id = %s", (str(commission), OWNER_ID))
+                    cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, 'commission_timeout', %s, %s)", (OWNER_ID, str(commission), f"Comm timeout {game_id}"))
+                
+                cursor.execute("UPDATE games SET status = 'finished_timeout', finished_at = CURRENT_TIMESTAMP WHERE id = %s", (game_id,))
+                db.commit()
+        except Exception:
+            db.rollback(); return
+    
+    ACTIVE_TIMERS.pop(game_id, None)
+    
+    # ارسال پیام تایم اوت
+    emoji, name = GAME_INFO[game["game_type"]]
+    if winner_id and int(winner_id) > 0:
+        winner_tag = user_tag(int(winner_id))
+        text = f"⏰ <b>زمان به پایان رسید!</b>\n\n💰 جایزه به {winner_tag} رسید.\n📊 نتیجه: {money(payout)} {CURRENCY}"
+        await safe_send_message(context.bot, game["chat_id"], text, parse_mode="HTML")
+    else:
+        await safe_send_message(context.bot, game["chat_id"], "⏰ زمان تمام شد. بازی باطل شد.", parse_mode="HTML")
+
+async def game_timer_warning_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    game_id = job.data.get("game_id")
+    game = get_game(game_id)
+    if not game or game["status"] not in ("creator_turn", "opponent_turn"): return
+    
+    user_id = game["creator_id"] if game["status"] == "creator_turn" else game["opponent_id"]
+    if user_id and int(user_id) > 0:
+        tag = user_tag(int(user_id))
+        await safe_send_message(
+            context.bot, game["chat_id"],
+            f"⚠️ <b>هشدار!</b> {tag} فقط ۱۰ ثانیه وقت داری!",
+            parse_mode="HTML"
+        )
+
+def schedule_game_timer(app, game_id):
+    if game_id in ACTIVE_TIMERS:
+        try: ACTIVE_TIMERS[game_id].schedule_removal()
+        except: pass
+    if app.job_queue:
+        # تایمر اصلی
+        job = app.job_queue.run_once(game_timer_job, GAME_TIMER_SECONDS, data={"game_id": game_id})
+        # تایمر هشدار
+        app.job_queue.run_once(game_timer_warning_job, GAME_TIMER_SECONDS - 10, data={"game_id": game_id})
+        ACTIVE_TIMERS[game_id] = job
 
 async def join_game_callback(update, context):
     query, user = update.callback_query, update.callback_query.from_user
@@ -1146,6 +1240,7 @@ async def join_game_callback(update, context):
     if sent:
         with get_db() as db:
             with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
+    schedule_game_timer(context.application, game_id)
 
 async def bot_game_callback(update, context):
     query, user = update.callback_query, update.callback_query.from_user
@@ -1169,11 +1264,17 @@ async def bot_game_callback(update, context):
     if sent:
         with get_db() as db:
             with db.cursor() as cursor: cursor.execute("UPDATE games SET message_id = %s WHERE id = %s", (sent.message_id, game_id)); db.commit()
+    schedule_game_timer(context.application, game_id)
 
 async def cancel_game_callback(update, context):
     query, user = update.callback_query, update.callback_query.from_user
     try: game_id = int(query.data.replace("cancel_", ""))
     except: return
+    if game_id in ACTIVE_TIMERS:
+        try: ACTIVE_TIMERS[game_id].schedule_removal()
+        except: pass
+        ACTIVE_TIMERS.pop(game_id, None)
+    
     with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
@@ -1268,6 +1369,11 @@ async def bot_roll_game(context, game_id):
         except: db.rollback()
 
 async def finish_game(context, game_id):
+    if game_id in ACTIVE_TIMERS:
+        try: ACTIVE_TIMERS[game_id].schedule_removal()
+        except: pass
+        ACTIVE_TIMERS.pop(game_id, None)
+        
     with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
@@ -1275,15 +1381,25 @@ async def finish_game(context, game_id):
                 game = cursor.fetchone()
                 if not game or game["status"] not in ("finishing", "bot_turn"): db.rollback(); return
                 
-                cursor.execute("UPDATE games SET status = 'finished', finished_at = CURRENT_TIMESTAMP WHERE id = %s", (game_id,))
                 c_id, o_id, mode, bet = int(game["creator_id"]), game["opponent_id"], game["mode"], Decimal(game["bet"])
                 c_total, o_total = int(game["creator_total"]), int(game["opponent_total"])
                 c_list, o_list = game["creator_rolls_list"], game["opponent_rolls_list"]
                 
+                if c_total == o_total:
+                    # مساوی - ریست پرتاب ها برای راند جدید
+                    cursor.execute("UPDATE games SET status = 'creator_turn', creator_rolls = 0, opponent_rolls = 0, creator_rolls_list = '', opponent_rolls_list = '', creator_total = 0, opponent_total = 0 WHERE id = %s", (game_id,))
+                    db.commit()
+                    
+                    text = generate_result_text(game["game_type"], mode, c_id, c_list, c_total, o_id, o_list, o_total, 0, 0)
+                    await safe_send_message(context.bot, game["chat_id"], text, parse_mode="HTML")
+                    schedule_game_timer(context.application, game_id)
+                    return
+                
+                cursor.execute("UPDATE games SET status = 'finished', finished_at = CURRENT_TIMESTAMP WHERE id = %s", (game_id,))
                 pool = bet * 2
                 payout = (bet * WIN_MULTIPLIER).quantize(Decimal("0.00000001"))
                 commission = pool - payout
-                winner_id = None
+                winner_id = c_id if c_total > o_total else (int(o_id) if o_id and int(o_id) > 0 else -1)
 
                 def credit(uid, amt, ttype, desc):
                     if not isinstance(uid, int) or uid <= 0: return
@@ -1291,18 +1407,12 @@ async def finish_game(context, game_id):
                     cursor.execute("UPDATE users SET balance = CAST(balance AS NUMERIC) + %s WHERE user_id = %s", (str(amt), uid))
                     cursor.execute("INSERT INTO transactions(user_id, type, amount, description) VALUES (%s, %s, %s, %s)", (uid, ttype, str(amt), desc))
 
-                if c_total == o_total:
-                    credit(c_id, bet, "draw_refund", f"Draw {game_id}")
-                    if mode == "friends" and o_id and int(o_id) > 0: credit(int(o_id), bet, "draw_refund", f"Draw {game_id}")
-                    winner_id = 0
-                else:
-                    winner_id = c_id if c_total > o_total else (int(o_id) if o_id and int(o_id) > 0 else -1)
-                    credit(winner_id, payout, "game_win", f"Win {game_id}")
-                    credit(OWNER_ID, commission, "commission", f"Comm {game_id}")
+                credit(winner_id, payout, "game_win", f"Win {game_id}")
+                credit(OWNER_ID, commission, "commission", f"Comm {game_id}")
                 db.commit()
         except: db.rollback(); logger.exception("Finish failed"); return
 
-    text = generate_result_text(game["game_type"], mode, c_id, c_list, c_total, o_id, o_list, o_total, winner_id, payout if winner_id != 0 else bet)
+    text = generate_result_text(game["game_type"], mode, c_id, c_list, c_total, o_id, o_list, o_total, winner_id, payout)
     await safe_send_message(context.bot, game["chat_id"], text, parse_mode="HTML")
 
 async def reset_game_internal(context, game_id, reason="manual"):
