@@ -37,8 +37,8 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
-# ⚠️ لینک دیتابیس (پورت 6543 برای سرعت بالا تنظیم شد)
-DATABASE_URL = "postgresql://postgres.pqvuttwpkmhjhnccflxi:Ali1365277356@aws-0-ap-south-1.pooler.supabase.com:6543/postgres"
+# ✅ لینک دیتابیس اروپا (ایرلند) با پورت 6543 برای سرعت بالا
+DATABASE_URL = "postgresql://postgres.uuijbdccragxaumbblhw:Mmad1365277356@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
 
 CURRENCY = "TRX"
 MIN_GAME_BET = Decimal("0.1")
@@ -70,7 +70,8 @@ def init_db_pool():
     global db_pool
     if db_pool is None:
         try:
-            db_pool = psycopg2.pool.SimpleConnectionPool(1, 15, DATABASE_URL, sslmode='require')
+            # ✏️ کاهش تعداد اتصال به 5 برای فشار کمتر به دیتابیس
+            db_pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL, sslmode='require')
             logger.info("Database pool created.")
         except Exception as e:
             logger.error(f"Error creating DB pool: {e}")
@@ -696,7 +697,6 @@ async def handle_withdraw_wallet(update, context, wallet):
         await message.reply_text("❌ خطا. دوباره تلاش کنید."); return
     context.user_data.pop("withdraw_step", None); context.user_data.pop("withdraw_amount", None)
     
-    # بررسی و کسر در یک تراکنش
     with get_db() as db:
         try:
             with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
