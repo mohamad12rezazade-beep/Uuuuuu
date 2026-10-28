@@ -37,7 +37,7 @@ GROUP_USERNAME = "@GAP_BAZIN1"
 GROUP_URL = "https://t.me/GAP_BAZIN1"
 GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
-# ✅ لینک دیتابیس اروپا (ایرلند) با پورت 6543 برای سرعت بالا
+# ✅ لینک دیتابیس اروپا (ایرلند) با پورت 6543
 DATABASE_URL = "postgresql://postgres.uuijbdccragxaumbblhw:Mmad1365277356@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
 
 CURRENCY = "TRX"
@@ -53,15 +53,13 @@ GAME_TIMEOUT_MINUTES = 30
 PENDING_PROOF: dict = {}
 PENDING_CAPTCHA: dict = {}
 DOT_CHARS = [".", "۔", "•", "·", "⋅", "٫", "٬", "。", "｡", "…"]
-
-# کش قیمت‌ها برای جلوگیری از تاخیر
 PRICE_CACHE = {"trx_usd": None, "usdt_toman": None, "last_update": 0}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("BET_BT")
 
 # ============================================================
-# DATABASE (POSTGRESQL WITH POOLING)
+# DATABASE
 # ============================================================
 
 db_pool = None
@@ -70,7 +68,6 @@ def init_db_pool():
     global db_pool
     if db_pool is None:
         try:
-            # ✏️ کاهش تعداد اتصال به 5 برای فشار کمتر به دیتابیس
             db_pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL, sslmode='require')
             logger.info("Database pool created.")
         except Exception as e:
@@ -476,7 +473,7 @@ def admin_reply_keyboard():
     return ReplyKeyboardMarkup([["📊 آمار ربات", status], ["➕ شارژ کاربر", "➖ کسر کاربر"], ["🏧 برداشت‌های در انتظار"], ["💰 موجودی کاربران"], ["🚫 بن کاربر", "✅ آنبن کاربر"], ["➕ افزایش پاداش", "➖ کاهش پاداش"], ["🏠 منوی اصلی"]], resize_keyboard=True, is_persistent=True)
 
 async def send_start_menu(context, chat_id, user_id):
-    text = f"🤖 BET_BT\n\n💰 موجودی: {money(get_balance(user_id))} {CURRENCY}\n🆔 آیدی شما: <code>{user_id}</code>\n\nاز دکمه‌های پایین صفحه استفاده کنید 👇\n\n🎮 بازی فقط در گپ:\n{GROUP_URL}\n\nمثال: <code>3 تاس 0.5</code>"
+    text = f"🤖 BET_BT\n\n💰 موجودی: {money(get_balance(user_id))} {CURRENCY}\n🆔 آیدی شما: <code>{user_id}</code>\n\nاز دکمه‌های پایین صفحه استفاده کنید 👇\n\n🎮 بازی فقط در گپ:\n{GROUP_URL}\n\nمثال: <code>تاس 3</code> یا <code>3 تاس 0.5</code>"
     kwargs = {"parse_mode": "HTML"}
     if is_pv_chat_id(chat_id): kwargs["reply_markup"] = main_keyboard()
     await safe_send_message(context.bot, chat_id, text, **kwargs)
@@ -506,9 +503,6 @@ async def start(update, context):
         await try_grant_referral(user.id, context)
     await send_start_menu(context, update.effective_chat.id, user.id)
 
-# ============================================================
-# ✏️ تابع موجودی با قیمت لحظه‌ای (با کش)
-# ============================================================
 async def show_balance(update, context, target=None):
     user = update.effective_user
     ensure_user(user)
@@ -618,7 +612,7 @@ async def show_referral(update, context, target=None):
         await update.message.reply_text(text, **kwargs)
 
 async def show_help(update, context, target=None):
-    text = f"📚 راهنما\n\n💰 موجودی — نمایش موجودی\n👥 زیرمجموعه — پاداش {money(get_referral_reward())} {CURRENCY}\n🏧 برداشت TRX — حداقل {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n🔄 انتقال: <code>انتقال 0.5</code> یا <code>انتقال 0.5 123456789</code>\n\n🎮 بازی: <code>3 تاس 0.5</code>\nحداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}"
+    text = f"📚 راهنما\n\n💰 موجودی — نمایش موجودی\n👥 زیرمجموعه — پاداش {money(get_referral_reward())} {CURRENCY}\n🏧 برداشت TRX — حداقل {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n🔄 انتقال: <code>انتقال 0.5</code> یا <code>انتقال 0.5 123456789</code>\n\n🎮 بازی: <code>تاس 3</code> (شرط پیش‌فرض {money(MIN_GAME_BET)}) یا <code>3 تاس 0.5</code> (تعداد و شرط دلخواه)\nحداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}"
     if target: await safe_send_message(context.bot, target, text, parse_mode="HTML")
     elif update.callback_query:
         try: await update.callback_query.edit_message_text(text, parse_mode="HTML")
@@ -960,13 +954,29 @@ GAME_EMOJI = {"dice": "🎲", "darts": "🎯", "bowling": "🎳", "basketball": 
 
 def parse_game(text):
     text = normalize_digits(text.strip())
-    match = re.match(r"^(\d+)\s+([^\s]+)\s+([0-9]+(?:\.[0-9]+)?)$", text)
-    if not match: return None
-    count = int(match.group(1)); name = match.group(2).lower(); bet = parse_amount(match.group(3))
-    if count < 1: return None
-    if MAX_GAME_COUNT is not None and count > MAX_GAME_COUNT: return "count_too_high"
-    if bet is None or name not in GAME_NAMES: return None
-    return (count, GAME_NAMES[name], bet)
+    
+    # ۱. فرمت جدید: اسم بازی + تعداد پرتاب (مثلاً "دارت 1" یا "تاس 3")
+    match_new = re.match(r"^([^\s]+)\s+(\d+)$", text)
+    if match_new:
+        name = match_new.group(1).lower()
+        count = int(match_new.group(2))
+        if name in GAME_NAMES:
+            if count < 1: return None
+            if MAX_GAME_COUNT is not None and count > MAX_GAME_COUNT: return "count_too_high"
+            return (count, GAME_NAMES[name], MIN_GAME_BET)
+
+    # ۲. فرمت قدیمی: تعداد + اسم بازی + مبلغ (مثلاً "3 تاس 0.5")
+    match_old = re.match(r"^(\d+)\s+([^\s]+)\s+([0-9]+(?:\.[0-9]+)?)$", text)
+    if match_old:
+        count = int(match_old.group(1))
+        name = match_old.group(2).lower()
+        bet = parse_amount(match_old.group(3))
+        if count < 1: return None
+        if MAX_GAME_COUNT is not None and count > MAX_GAME_COUNT: return "count_too_high"
+        if bet is None or name not in GAME_NAMES: return None
+        return (count, GAME_NAMES[name], bet)
+
+    return None
 
 def get_active_game_for_user(chat_id, user_id):
     with get_db() as db:
@@ -1428,8 +1438,23 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     application.add_error_handler(error_handler)
     if application.job_queue: application.job_queue.run_repeating(cleanup_job, interval=300, first=60)
-    logger.info("BET_BT started successfully.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    
+    PORT = int(os.environ.get("PORT", 8443))
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+    
+    if WEBHOOK_URL:
+        logger.info(f"Starting webhook on port {PORT} with URL: {WEBHOOK_URL}")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="/webhook",
+            webhook_url=f"{WEBHOOK_URL}/webhook",
+            drop_pending_updates=False,
+            allowed_updates=Update.ALL_TYPES
+        )
+    else:
+        logger.info("WEBHOOK_URL not set. Falling back to polling (slower).")
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 if __name__ == "__main__":
     main()
