@@ -42,7 +42,7 @@ DATABASE_URL = "postgresql://postgres.uuijbdccragxaumbblhw:Mmad1365277356@aws-0-
 CURRENCY = "TRX"
 MIN_GAME_BET = Decimal("0.1")
 MAX_GAME_BET = None
-MAX_GAME_COUNT = 5
+MAX_GAME_COUNT = 3
 DEFAULT_REFERRAL_REWARD = Decimal("0.05")
 MIN_WITHDRAWAL = Decimal("2")
 WIN_MULTIPLIER = Decimal("1.8")
@@ -521,7 +521,7 @@ def admin_reply_keyboard():
     return ReplyKeyboardMarkup([["📊 آمار ربات", status], ["➕ شارژ کاربر", "➖ کسر کاربر"], ["🏧 برداشت‌های در انتظار"], ["💰 موجودی کاربران"], ["🚫 بن کاربر", "✅ آنبن کاربر"], ["➕ افزایش پاداش", "➖ کاهش پاداش"], ["🏠 منوی اصلی"]], resize_keyboard=True, is_persistent=True)
 
 async def send_start_menu(context, chat_id, user_id):
-    text = f"🤖 BET_BT\n\n💰 موجودی: {money(get_balance(user_id))} {CURRENCY}\n🆔 آیدی شما: <code>{user_id}</code>\n\nاز دکمه‌های پایین صفحه استفاده کنید 👇\n\n🎮 بازی فقط در گپ:\n{GROUP_URL}\n\nمثال: <code>تاس 3</code> یا <code>3 تاس 0.5</code>"
+    text = f"🤖 BET_BT\n\n💰 موجودی: {money(get_balance(user_id))} {CURRENCY}\n🆔 آیدی شما: <code>{user_id}</code>\n\nاز دکمه‌های پایین صفحه استفاده کنید 👇\n\n🎮 بازی فقط در گپ:\n{GROUP_URL}\n\nمثال: <code>تاس 0.1</code> یا <code>تاس 1</code>"
     kwargs = {"parse_mode": "HTML"}
     if is_pv_chat_id(chat_id): kwargs["reply_markup"] = main_keyboard()
     await safe_send_message(context.bot, chat_id, text, **kwargs)
@@ -602,13 +602,17 @@ async def show_my_id(update, context, target=None):
     user = update.effective_user
     ensure_user(user)
     text = f"🆔 آیدی عددی شما\n\n<code>{user.id}</code>\n\nمثال انتقال:\n<code>انتقال 0.5 {user.id}</code>"
-    if target: await safe_send_message(context.bot, target, text, parse_mode="HTML")
+    if target: 
+        await safe_send_message(context.bot, target, text, parse_mode="HTML")
     elif update.callback_query:
-        try: await update.callback_query.edit_message_text(text, parse_mode="HTML")
-        except: pass
+        try: 
+            await update.callback_query.edit_message_text(text, parse_mode="HTML")
+        except: 
+            pass
     else:
         kwargs = {"reply_to_message_id": update.message.message_id, "parse_mode": "HTML"}
-        if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+        if update.message.chat.type != ChatType.PRIVATE: 
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
         await update.message.reply_text(text, **kwargs)
 
 async def show_referral(update, context, target=None):
@@ -631,11 +635,12 @@ async def show_referral(update, context, target=None):
             pass
     else:
         kwargs = {"reply_to_message_id": update.message.message_id}
-        if update.message.chat.type != ChatType.PRIVATE: kwargs["reply_markup"] = ReplyKeyboardRemove()
+        if update.message.chat.type != ChatType.PRIVATE: 
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
         await update.message.reply_text(text, **kwargs)
 
 async def show_help(update, context, target=None):
-    text = f"📚 راهنما\n\n💰 موجودی — نمایش موجودی\n👥 زیرمجموعه — پاداش {money(get_referral_reward())} {CURRENCY}\n🏧 برداشت TRX — حداقل {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n🔄 انتقال: <code>انتقال 0.5</code> یا <code>انتقال 0.5 123456789</code>\n\n🎮 بازی: <code>تاس 3</code> (شرط پیش‌فرض {money(MIN_GAME_BET)}) یا <code>3 تاس 0.5</code> (تعداد و شرط دلخواه)\nحداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}"
+    text = f"📚 راهنما\n\n💰 موجودی — نمایش موجودی\n👥 زیرمجموعه — پاداش {money(get_referral_reward())} {CURRENCY}\n🏧 برداشت TRX — حداقل {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n🔄 انتقال: <code>انتقال 0.5</code> یا <code>انتقال 0.5 123456789</code>\n\n🎮 بازی: <code>تاس 0.1</code> یا <code>تاس 1</code> (اسم بازی + مبلغ شرط)\nحداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}"
     if target: await safe_send_message(context.bot, target, text, parse_mode="HTML")
     elif update.callback_query:
         try: await update.callback_query.edit_message_text(text, parse_mode="HTML")
@@ -978,15 +983,15 @@ GAME_EMOJI = {"dice": "🎲", "darts": "🎯", "bowling": "🎳", "basketball": 
 def parse_game(text):
     text = normalize_digits(text.strip())
     
-    match_new = re.match(r"^([^\s]+)\s+(\d+)$", text)
+    # فرمت جدید: اسم بازی + مبلغ شرط (مثلاً "تاس 0.1" یا "تاس 1")
+    match_new = re.match(r"^([^\s]+)\s+([0-9]+(?:\.[0-9]+)?)$", text)
     if match_new:
         name = match_new.group(1).lower()
-        count = int(match_new.group(2))
-        if name in GAME_NAMES:
-            if count < 1: return None
-            if MAX_GAME_COUNT is not None and count > MAX_GAME_COUNT: return "count_too_high"
-            return (count, GAME_NAMES[name], MIN_GAME_BET)
+        bet = parse_amount(match_new.group(2))
+        if name in GAME_NAMES and bet is not None:
+            return (1, GAME_NAMES[name], bet)
 
+    # فرمت قدیمی: تعداد + اسم بازی + مبلغ شرط (مثلاً "3 تاس 0.5")
     match_old = re.match(r"^(\d+)\s+([^\s]+)\s+([0-9]+(?:\.[0-9]+)?)$", text)
     if match_old:
         count = int(match_old.group(1))
@@ -1541,7 +1546,7 @@ async def text_handler(update, context):
         if match_reply: await transfer(update, context, parse_amount(match_reply.group(1)) or Decimal("0")); return
         await message.reply_text("❌ فرمت صحیح:\n1️⃣ <code>انتقال 0.5</code>\n2️⃣ <code>انتقال 0.5 123456789</code>", parse_mode="HTML"); return
     game = parse_game(text)
-    if game == "count_too_high": await message.reply_text(f"❌ حداکثر تعداد پرتاب {MAX_GAME_COUNT} است.\nمثال:\n3 تاس 0.5"); return
+    if game == "count_too_high": await message.reply_text(f"❌ حداکثر تعداد پرتاب {MAX_GAME_COUNT} است.\nمثال:\nتاس 0.5"); return
     if game:
         if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP): await message.reply_text("❌ بازی‌ها فقط داخل گپ انجام می‌شوند."); return
         if not is_game_chat(message.chat): await message.reply_text(f"❌ بازی فقط در گپ زیر مجاز است:\n{GROUP_URL}"); return
